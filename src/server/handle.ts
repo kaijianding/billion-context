@@ -44,7 +44,7 @@ import { resolveClaudeTranscriptLineage } from "../claude-transcript-lineage.js"
 import { consumePluginRegisterFor, pluginAgentHeader, pluginCompressionProxyHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginReportedModel, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, publicForkInputCheck, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "../plugin.js";
 import { scheduleAffinityPersist } from "../affinity-persist.js";
 import { evaluateChain, extractChainCarriers } from "../chain-checkpoint.js";
-import { BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, googlePathKind, isLoopbackAddress, normalizeUpstreamOrigin, provenCompletionReserve, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, type WireProtocol } from "../util.js";
+import { BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, googlePathKind, isLoopbackAddress, normalizeUpstreamOrigin, provenCompletionReserve, reserveOutputHeadroom, resolveOutputHeadroomCap, rewrapAntigravityEnvelope, shouldReserveOutputHeadroom, unwrapAntigravityEnvelope, type WireProtocol } from "../util.js";
 import { checkTunnelDestination, tunnelAllowlistFromEnv } from "../tunnel-guard.js";
 import { resolveCompatDropFields } from "../compat-drop.js";
 import { DecompressedTooLargeError, decodeRequestBody } from "../content-encoding.js";
@@ -551,6 +551,20 @@ async function handleRequest(
     //  index builds (each one re-converts the full history wire→core). The
     //  predicate over-approximates by design; see bodyMightCarryImages.
     const bodyMayCarryImages = protocol !== null && bodyText !== undefined ? bodyMightCarryImages(bodyText, protocol) : false;
+    // omp's google-antigravity provider sends the real Gemini body inside an
+    // envelope {project, model, request:{...}} (agent-wire antigravity shape).
+    // Every google consumer below (identity signal, affinity list, strip,
+    // prepareGoogle) reads `contents` at the TOP level, so an enveloped body
+    // resolves no conversation and dies with the #286 400. Unwrap here — the
+    // shell is re-applied on egress (see the runPreparedPipeline return).
+    const unwrapped = protocol === "google" ? unwrapAntigravityEnvelope(parsed) : { inner: parsed, shell: undefined };
+    const antigravityShell = unwrapped.shell;
+    if (antigravityShell !== undefined && unwrapped.inner !== parsed) {
+        parsed = unwrapped.inner;
+        const proj = typeof antigravityShell.project === "string" ? antigravityShell.project : "";
+        const mod = typeof antigravityShell.model === "string" ? antigravityShell.model : "";
+        log("info", `[google] unwrapped omp antigravity envelope (project=${proj || "?"} model=${mod || "?"}) — ${maskUrlForLog(req.url ?? "")}`);
+    }
     // #903: inbound message count for the per-request cost line — messages
     // (anthropic/openai) or input (responses); null when the body has neither.
     const inboundMsgs: number | null = (() => {
@@ -2805,7 +2819,11 @@ async function handleRequest(
                 // here rather than behind the response stream setup.
                 await yieldToEventLoop();
                 logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0, prepared!.body);
-                return { body: prepared!.body, prepared: prepared! };
+                // omp antigravity: the rebuilt GoogleRequestBody must go back
+                // inside the {project, model, request} envelope the upstream
+                // provider expects (the shell captured at inbound unwrap).
+                const egressBody = rewrapAntigravityEnvelope(antigravityShell, prepared!.body);
+                return { body: egressBody, prepared: prepared! };
             };
             // #1884/#2090 (un-armed signed traffic): a request that already
             // carries a body-covering signature (SDK-HMAC-SHA256 family —

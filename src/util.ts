@@ -816,3 +816,32 @@ function blockText(v: unknown): string | undefined {
     }
     return undefined;
 }
+/**
+ * omp's google-antigravity provider sends its Gemini body inside an envelope
+ * `{project, model, request:{...}}` (agent-wire antigravity shape; the real
+ * GoogleRequestBody — contents/tools/systemInstruction — lives in `request`).
+ * The google adapter reads `contents` at the TOP level, so an enveloped body
+ * resolves no conversation and dies with the #286 400. Detect the envelope:
+ * top-level `request` object whose `contents` is an array, while the top level
+ * itself has NO `contents` array (a plain Gemini body has contents at top).
+ */
+export function unwrapAntigravityEnvelope(parsed: unknown): { inner: unknown; shell: Record<string, unknown> | undefined } {
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return { inner: parsed, shell: undefined };
+    const top = parsed as Record<string, unknown>;
+    if (Array.isArray(top.contents)) return { inner: parsed, shell: undefined };
+    const req = top.request;
+    if (req === null || typeof req !== "object" || Array.isArray(req)) return { inner: parsed, shell: undefined };
+    if (!Array.isArray((req as Record<string, unknown>).contents)) return { inner: parsed, shell: undefined };
+    return { inner: req, shell: top };
+}
+
+/** Re-wrap a rebuilt GoogleRequestBody into the omp antigravity envelope. */
+export function rewrapAntigravityEnvelope(shell: Record<string, unknown> | undefined, body: string | Buffer): string | Buffer {
+    if (!shell) return body;
+    try {
+        const inner = typeof body === "string" ? body : body.toString("utf8");
+        return JSON.stringify({ ...shell, request: JSON.parse(inner) });
+    } catch {
+        return body;
+    }
+}
