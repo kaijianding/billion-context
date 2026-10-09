@@ -131,6 +131,24 @@ export function currentCalibrationFactor(stats: { calibratedEstimate?: number; c
 export type WireProtocol = "anthropic" | "openai" | "responses" | "google";
 
 /**
+ * Classify a Gemini native request path. The model and the method both live
+ *  in the path, never in the body: `/v1beta/models/<model>:streamGenerateContent`
+ *  (streaming, usually with `alt=sse`), `:generateContent` (single shot) and
+ *  `:countTokens`. Returns null for every other path (model listing, files,
+ *  cachedContents, the OpenAI-compatible `/v1beta/openai/...` mirror).
+ *  Shared by the proxy (server.ts) and the native fetch patch
+ *  (agent/native-intercept.ts) — keep one definition so the wire-classification
+ *  and the URL-shape gate cannot drift apart. */
+export type GooglePathKind = "stream-generate" | "generate" | "count-tokens";
+
+export function googlePathKind(urlPath: string): GooglePathKind | null {
+    if (urlPath.includes(":streamGenerateContent")) return "stream-generate";
+    if (urlPath.includes(":generateContent")) return "generate";
+    if (urlPath.includes(":countTokens")) return "count-tokens";
+    return null;
+}
+
+/**
  * Compute the true TOTAL input-token count and the cached subset from a
  * protocol-native `usage` object.
  *

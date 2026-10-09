@@ -15,6 +15,9 @@ test("isModelApiUrl: matches model-API endpoint shapes", () => {
     assert.equal(isModelApiUrl("https://open.bigmodel.cn/api/coding/paas/v4/chat/completions"), true);
     assert.equal(isModelApiUrl("https://api.anthropic.com/v1/messages?beta=true"), true);
     assert.equal(isModelApiUrl("http://localhost:9123/v1/messages/"), true);
+    assert.equal(isModelApiUrl("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:streamGenerateContent?alt=sse"), true);
+    assert.equal(isModelApiUrl("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"), true);
+    assert.equal(isModelApiUrl("https://aiplatform.googleapis.com/v1/models/gemini-pro:countTokens"), true);
 });
 
 test("isModelApiUrl: matches Google native wire shapes (#2493)", () => {

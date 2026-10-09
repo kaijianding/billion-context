@@ -12,7 +12,7 @@ import { logHostEvent } from "./host-log.js";
 import { envMillis } from "./native-bootstrap.js";
 import { mediaBytesOfWireBody } from "./media-bytes.js";
 import { probeLiveness, type LivenessVerdict } from "../liveness.js";
-import { BILI_PASSTHROUGH_HEADER, MIN_ASSUMED_WINDOW_TOKENS } from "../util.js";
+import { BILI_PASSTHROUGH_HEADER, MIN_ASSUMED_WINDOW_TOKENS, googlePathKind } from "../util.js";
 import { DSH_COMPACTION_MARKER_SNIFF } from "../server/dsh-compaction-guard.js";
 import { APIG_RESIGN_HEADER, APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_SCHEME, clearSignedRefusal, encodeApigCredential, inboundSignedScheme, recordSignedRefusal, resignEnabled, resignPassthroughEnabled, signedRefusal } from "../apig-resign.js";
 
@@ -283,6 +283,7 @@ export function isModelApiUrl(url: string): boolean {
         const segments = u.pathname.split("/").filter((s) => s.length > 0);
         if (segments[0] === "bili") return false;
         const pathname = u.pathname.replace(/\/+$/, "");
+        if (googlePathKind(pathname) !== null) return true;
         return MODEL_API_SUFFIX.test(pathname);
     } catch {
         return false;

@@ -58,7 +58,7 @@ import { clearUpstreamAlertsForHost, noteCircuitFailFastLog, recordUpstreamAlert
 import { describeUpstreamFailure, formatUpstreamError, proxyDispatcher, recordUpstreamConnection } from "../upstream-proxy.js";
 import { markExpectedFailFast, withUpstreamFailure, type UpstreamFailureKind } from "../upstream-fail.js";
 import { noteUpstreamThrottle429, noteUpstreamThrottleResolved, upstreamThrottleLocalReject } from "../upstream-throttle.js";
-import { applyEstimateCalibration, currentCalibrationFactor, inspectContextOverflow, isMarkerlessOverflowReject, MIN_ASSUMED_WINDOW_TOKENS, normalizeUpstreamOrigin, usageOutputTotal, usageTotals, type ContextOverflowInfo, type WireProtocol } from "../util.js";
+import { applyEstimateCalibration, currentCalibrationFactor, googlePathKind, inspectContextOverflow, isMarkerlessOverflowReject, MIN_ASSUMED_WINDOW_TOKENS, normalizeUpstreamOrigin, usageOutputTotal, usageTotals, type ContextOverflowInfo, type WireProtocol } from "../util.js";
 import { billOutputUsage } from "../billing.js";
 import { DUMP_PLAINTEXT_BANNER } from "../dump-banner.js";
 import { recordPckAblation } from "../pck-probe.js";
@@ -68,7 +68,7 @@ import { buildForwardHeaders, connectionNamedHeaders, RESPONSE_ONLY_STRIP_HEADER
 import { bodyDumpEnabled, logDumpFailure } from "./observability.js";
 import { effectiveAbsorbBlock } from "./prepare-responses.js";
 import { awaitDrain, bufferToStream, dumpStreamToFile, pipeThrough, readStreamToBuffer } from "./stream-io.js";
-import { buildForwardTarget, outboundPayloadBreakdown, registerRequestAbort, beginStreamKeepalive, effectiveTokenCount, googlePathKind, imageBillingFor, imageTokenCapFor, inboundResignCredential, outboundContextEstimates, repairResponsesAssistantOrdering, resolveUpstream, stripKernelSummaries, usageGradeInputBaseline, DOOMED_PROBE_ABSOLUTE_BYTES, DOOMED_PROBE_BYTES_PER_TOKEN, type Prepared } from "../server.js";
+import { buildForwardTarget, outboundPayloadBreakdown, registerRequestAbort, beginStreamKeepalive, effectiveTokenCount, googlePathKind, imageBillingFor, imageTokenCapFor, inboundResignCredential, outboundContextEstimates, repairResponsesAssistantOrdering, resignSettingsFor, resolveUpstream, stripKernelSummaries, usageGradeInputBaseline, DOOMED_PROBE_ABSOLUTE_BYTES, DOOMED_PROBE_BYTES_PER_TOKEN, type Prepared } from "../server.js";
 
 /** Infer the wire protocol from the request path for compat-role rewrites on
  *  requests the pipeline did not prepare (passthrough). Mirrors the path

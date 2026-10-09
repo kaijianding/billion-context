@@ -123,7 +123,7 @@ import { consumePluginRegisterFor, flushConversations, handlePluginCompact, hand
 import { setupMitm, readMitmUpstream, getBlindTunnelStats, liveBlindTunnels, MITM_RAW_SOCKET_KEY } from "./mitm.js";
 import { evaluateChain, extractChainCarriers, stripEmbeddedChainCarriers } from "./chain-checkpoint.js";
 import type { BiliMessage } from "acp-kernel/wire";
-import { appendSystemText, applyEstimateCalibration, currentCalibrationFactor, BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, hardenOpenaiAssistantContent, isLoopbackAddress, normalizeUpstreamOrigin, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, systemToUser, strippedResponseIdWarning, type WireProtocol } from "./util.js";
+import { appendSystemText, applyEstimateCalibration, currentCalibrationFactor, BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, googlePathKind, hardenOpenaiAssistantContent, isLoopbackAddress, normalizeUpstreamOrigin, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, systemToUser, strippedResponseIdWarning, type WireProtocol } from "./util.js";
 
 import { BILI_TUNNEL_HEADER, checkTunnelDestination, classifyIp, localMachineIps, normalizeIpLiteral, parseIpLiteral, tunnelAllowlistFromEnv } from "./tunnel-guard.js";
 
@@ -398,15 +398,8 @@ function armRequestWatchdog(req: http.IncomingMessage, res: http.ServerResponse,
  *  in the path, never in the body: `/v1beta/models/<model>:streamGenerateContent`
  *  (streaming, usually with `alt=sse`), `:generateContent` (single shot) and
  *  `:countTokens`. Returns null for every other path (model listing, files,
- *  cachedContents, the OpenAI-compatible `/v1beta/openai/...` mirror). */
-type GooglePathKind = "stream-generate" | "generate" | "count-tokens";
-
-export function googlePathKind(urlPath: string): GooglePathKind | null {
-    if (urlPath.includes(":streamGenerateContent")) return "stream-generate";
-    if (urlPath.includes(":generateContent")) return "generate";
-    if (urlPath.includes(":countTokens")) return "count-tokens";
-    return null;
-}
+ *  cachedContents, the OpenAI-compatible `/v1beta/openai/...` mirror).
+ *  Moved to util.ts — see googlePathKind there (shared with native-intercept.ts). */
 
 /** The Gemini request carries the model in the URL path, never in the body
  *  (`POST /v1beta/models/gemini-3.8-flash:streamGenerateContent`). Every

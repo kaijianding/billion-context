@@ -44,7 +44,7 @@ import { resolveClaudeTranscriptLineage } from "../claude-transcript-lineage.js"
 import { consumePluginRegisterFor, pluginAgentHeader, pluginCompressionProxyHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginReportedModel, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, publicForkInputCheck, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "../plugin.js";
 import { scheduleAffinityPersist } from "../affinity-persist.js";
 import { evaluateChain, extractChainCarriers } from "../chain-checkpoint.js";
-import { BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, isLoopbackAddress, normalizeUpstreamOrigin, provenCompletionReserve, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, type WireProtocol } from "../util.js";
+import { BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, googlePathKind, isLoopbackAddress, normalizeUpstreamOrigin, provenCompletionReserve, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, type WireProtocol } from "../util.js";
 import { checkTunnelDestination, tunnelAllowlistFromEnv } from "../tunnel-guard.js";
 import { resolveCompatDropFields } from "../compat-drop.js";
 import { DecompressedTooLargeError, decodeRequestBody } from "../content-encoding.js";
