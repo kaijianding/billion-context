@@ -6,6 +6,7 @@ import { composeStreamFilters, createBiliArtifactFilter, createMarkerLineFilter,
 import { degenerateTurnWarning } from "../degenerate-turn.js";
 import { log as loggerLog } from "../logger.js";
 import { normalizeSseLineEndings, finalizeSseLineEndings } from "../sse-util.js";
+import { unwrapAntigravityEnvelope } from "../util.js";
 
 import type {
     CompressLoopAdapter,
@@ -287,7 +288,12 @@ export function createGoogleAdapter(
             if (notes && notes.length > 0) {
                 for (const text of notes) contents.push({ role: "user", parts: [{ text }] });
             }
-            const rebuilt: Record<string, unknown> = { ...body, contents };
+            // omp's antigravity envelope keeps the Gemini payload inside
+            // `request`; the rebuilt contents/systemInstruction must land
+            // INSIDE that shell — the v1internal wire rejects unknown
+            // top-level fields (contents/systemInstruction) with a 400.
+            const { inner, shell } = unwrapAntigravityEnvelope(body);
+            const rebuilt: Record<string, unknown> = { ...(inner as Record<string, unknown>), contents };
             // The model lives in the URL path, `alt=sse` in the query, and the
             // output cap in generationConfig.maxOutputTokens — a body carrying
             // any of these keys is rejected upstream.
@@ -298,7 +304,7 @@ export function createGoogleAdapter(
                 .filter((p): p is string => typeof p === "string" && p.length > 0)
                 .map((text) => ({ text }));
             if (parts.length > 0) rebuilt.systemInstruction = { parts };
-            return rebuilt;
+            return shell !== undefined ? { ...shell, request: rebuilt } : rebuilt;
         },
 
         async *parseStream(upstream, _round) {

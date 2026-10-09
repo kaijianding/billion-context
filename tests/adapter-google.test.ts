@@ -72,6 +72,47 @@ test("google buildRequest: contents + merged systemInstruction, request fields k
     assert.equal("max_tokens" in body, false, "the output cap lives in generationConfig");
 });
 
+test("google v1internal buildRequest: rebuilt contents/systemInstruction stay INSIDE the antigravity envelope", () => {
+    const ENVELOPE: Record<string, unknown> = {
+        project: "aicode-consumers",
+        requestId: "agent/agent-1/123/traj/0",
+        model: "gemini-3.8-flash-low",
+        userAgent: "antigravity",
+        requestType: "agent",
+        request: {
+            contents: [{ role: "user", parts: [{ text: "original" }] }],
+            systemInstruction: { role: "user", parts: [{ text: "sys" }] },
+            tools: [{ functionDeclarations: [{ name: "get_weather", description: "weather" }] }],
+            toolConfig: { functionCallingConfig: { mode: "VALIDATED" } },
+            generationConfig: { temperature: 0.7, maxOutputTokens: 8192 },
+            sessionId: "sess-1",
+            labels: { last_step_index: "0" },
+        },
+    };
+    const adapter = createGoogleAdapter(ENVELOPE, "client system", "bili_absorb", "gemini-3.8-flash-low", undefined, true);
+    const body = adapter.buildRequest(CORE_MESSAGES, "compress prompt", ENVELOPE);
+
+    assert.equal(body.project, "aicode-consumers", "shell project preserved");
+    assert.equal(body.requestId, "agent/agent-1/123/traj/0", "shell requestId preserved");
+    assert.equal(body.model, "gemini-3.8-flash-low", "shell model preserved");
+    assert.equal(body.userAgent, "antigravity", "shell userAgent preserved");
+    assert.equal(body.requestType, "agent", "shell requestType preserved");
+    assert.equal("contents" in body, false, "contents must NOT leak onto the shell (v1internal 400)");
+    assert.equal("systemInstruction" in body, false, "systemInstruction must NOT leak onto the shell (v1internal 400)");
+    const inner = body.request as Record<string, unknown>;
+    assert.ok(Array.isArray(inner.contents), "rebuilt contents live inside request");
+    assert.match(JSON.stringify(inner.contents), /fold the early history/, "user text reached the inner wire");
+    assert.deepEqual(
+        inner.systemInstruction,
+        { parts: [{ text: "client system" }, { text: "compress prompt" }] },
+        "merged systemInstruction lands inside request",
+    );
+    assert.deepEqual(inner.tools, (ENVELOPE.request as Record<string, unknown>).tools, "tools preserved inside request");
+    assert.deepEqual(inner.generationConfig, (ENVELOPE.request as Record<string, unknown>).generationConfig, "generationConfig preserved");
+    assert.deepEqual(inner.sessionId, "sess-1", "sessionId preserved");
+    assert.deepEqual(inner.labels, { last_step_index: "0" }, "labels preserved");
+});
+
 test("google parseStream: SSE frames yield text, reasoning, tool_call, usage, done in order", async () => {
     const events = await collect(
         createGoogleAdapter({}, undefined, undefined, "gemini-3-pro-preview"),
