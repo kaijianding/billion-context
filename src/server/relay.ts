@@ -58,7 +58,7 @@ import { clearUpstreamAlertsForHost, noteCircuitFailFastLog, recordUpstreamAlert
 import { describeUpstreamFailure, formatUpstreamError, proxyDispatcher, recordUpstreamConnection } from "../upstream-proxy.js";
 import { markExpectedFailFast, withUpstreamFailure, type UpstreamFailureKind } from "../upstream-fail.js";
 import { noteUpstreamThrottle429, noteUpstreamThrottleResolved, upstreamThrottleLocalReject } from "../upstream-throttle.js";
-import { applyEstimateCalibration, currentCalibrationFactor, googlePathKind, inspectContextOverflow, isMarkerlessOverflowReject, MIN_ASSUMED_WINDOW_TOKENS, normalizeUpstreamOrigin, usageOutputTotal, usageTotals, type ContextOverflowInfo, type WireProtocol } from "../util.js";
+import { applyEstimateCalibration, currentCalibrationFactor, inspectContextOverflow, isMarkerlessOverflowReject, MIN_ASSUMED_WINDOW_TOKENS, normalizeUpstreamOrigin, usageOutputTotal, usageTotals, type ContextOverflowInfo, type WireProtocol } from "../util.js";
 import { billOutputUsage } from "../billing.js";
 import { DUMP_PLAINTEXT_BANNER } from "../dump-banner.js";
 import { recordPckAblation } from "../pck-probe.js";

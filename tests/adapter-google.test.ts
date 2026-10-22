@@ -404,6 +404,8 @@ const responseOf = (parsed: Record<string, unknown>): Record<string, unknown> =>
     assert.ok(shell && typeof shell === "object", `frame carries the response shell: ${JSON.stringify(parsed).slice(0, 80)}`);
     return shell;
 };
+const candidatesOf = (shell: Record<string, unknown>): Array<Record<string, any>> =>
+    (shell.candidates as Array<Record<string, any>> | undefined) ?? [];
 
 test("google parseStream v1internal: unwraps {response:...} frames, passthrough keeps the shell", async () => {
     const events = await collect(
@@ -416,13 +418,13 @@ test("google parseStream v1internal: unwraps {response:...} frames, passthrough 
     const text = events[0];
     assert.ok(text.kind === "text" && text.delta === "Hello " && text.raw, "text delta with passthrough raw");
     if (text.kind === "text" && text.raw) {
-        const parts = responseOf(frameJson(text.raw)).candidates[0].content.parts;
+        const parts = candidatesOf(responseOf(frameJson(text.raw)))[0].content.parts;
         assert.equal(parts[0].text, "Hello ", "passthrough frame keeps the upstream shell");
     }
     const reason = events[1];
     assert.ok(reason.kind === "reasoning" && reason.delta === "weighing" && reason.raw, "reasoning delta with passthrough raw");
     if (reason.kind === "reasoning" && reason.raw) {
-        const parts = responseOf(frameJson(reason.raw)).candidates[0].content.parts;
+        const parts = candidatesOf(responseOf(frameJson(reason.raw)))[0].content.parts;
         assert.equal(parts[0].text, "weighing");
         assert.equal(parts[0].thought, true, "reasoning part survives the shell round-trip");
     }
@@ -450,9 +452,9 @@ test("google parseStream v1internal: an edited text frame is rebuilt and re-shel
     assert.ok(text.kind === "text" && text.delta === "final " && text.raw, "edited delta with rebuilt raw");
     if (text.kind === "text" && text.raw) {
         const shell = responseOf(frameJson(text.raw));
-        const parts = shell.candidates[0].content.parts;
+        const parts = candidatesOf(shell)[0].content.parts;
         assert.equal(parts[0].text, "final ", "rebuilt frame carries the clean bytes");
-        assert.equal(shell.candidates[0].finishReason, undefined, "dropped finishReason stays dropped inside the shell");
+        assert.equal(candidatesOf(shell)[0].finishReason, undefined, "dropped finishReason stays dropped inside the shell");
     }
 });
 
@@ -472,10 +474,10 @@ test("google parseStream v1internal: settle replay keeps the shelled call frame"
         assert.equal(call.passthrough, true, "real call is raw-replayed for the client");
     }
     const replay = events.find((e) => e.kind === "meta");
-    assert.ok(replay?.chunk, "settle replay has a chunk");
-    if (replay?.chunk) {
+    assert.ok(replay && replay.kind === "meta", "settle replay has a chunk");
+    if (replay && replay.kind === "meta" && replay.chunk) {
         // settle "keep" replay: original upstream bytes, shell intact
-        const parts = responseOf(frameJson(replay.chunk)).candidates[0].content.parts;
+        const parts = candidatesOf(responseOf(frameJson(replay.chunk)))[0].content.parts;
         assert.equal(parts[0].functionCall.name, "get_weather", "settle replay keeps the shelled call frame");
     }
 });
@@ -486,7 +488,12 @@ test("google parseStream v1internal: a top-level error frame passes through un-s
         sse({ error: { code: 500, message: "boom", status: "INTERNAL" } }),
     );
     assert.deepEqual(events.map((e) => e.kind), ["meta"], "error frame is handed through as a passthrough meta chunk");
-    const parsed = frameJson(events[0].chunk);
-    assert.equal(parsed.error?.status, "INTERNAL", "error payload intact");
-    assert.equal("response" in parsed, false, "no shell added to an error frame");
+    const first = events[0];
+    assert.ok(first && first.kind === "meta" && first.chunk, "meta chunk present");
+    if (first && first.kind === "meta" && first.chunk) {
+        const parsed = frameJson(first.chunk);
+        const err = parsed.error as Record<string, unknown> | undefined;
+        assert.equal(err?.status, "INTERNAL", "error payload intact");
+        assert.equal("response" in parsed, false, "no shell added to an error frame");
+    }
 });

@@ -124,6 +124,7 @@ import { setupMitm, readMitmUpstream, getBlindTunnelStats, liveBlindTunnels, MIT
 import { evaluateChain, extractChainCarriers, stripEmbeddedChainCarriers } from "./chain-checkpoint.js";
 import type { BiliMessage } from "acp-kernel/wire";
 import { appendSystemText, applyEstimateCalibration, currentCalibrationFactor, BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, googlePathKind, hardenOpenaiAssistantContent, isLoopbackAddress, normalizeUpstreamOrigin, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, systemToUser, strippedResponseIdWarning, type WireProtocol } from "./util.js";
+export { googlePathKind } from "./util.js";
 
 import { BILI_TUNNEL_HEADER, checkTunnelDestination, classifyIp, localMachineIps, normalizeIpLiteral, parseIpLiteral, tunnelAllowlistFromEnv } from "./tunnel-guard.js";
 
