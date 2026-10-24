@@ -1,0 +1,192 @@
+From ddb6ccbbd8ec873d3562aa3bdc88a1987a66a14f Mon Sep 17 00:00:00 2001
+From: dingkaijian <dingkaijian@shizhuang-inc.com>
+Date: Sat, 10 Oct 2026 00:08:54 +0800
+Subject: [PATCH 2/5] fix(server): unwrap/rewrap omp antigravity envelope for
+ google bodies
+
+omp's google-antigravity provider sends the real Gemini body inside an
+{project, model, request} envelope. All google consumers read contents at
+the top level, so an enveloped body resolved no conversation and died with
+the #286 400. Unwrap at inbound parse (shell captured for egress), and
+re-wrap the rebuilt GoogleRequestBody before forwarding. Pure helpers live
+in util.ts; patch script now applies every exported 000*.patch.
+---
+ src/server/handle.ts               | 22 +++++++-
+ src/util.ts                        | 29 +++++++++++
+ tests/antigravity-envelope.test.ts | 80 ++++++++++++++++++++++++++++++
+ 3 files changed, 129 insertions(+), 2 deletions(-)
+ create mode 100644 tests/antigravity-envelope.test.ts
+
+diff --git a/src/server/handle.ts b/src/server/handle.ts
+index a84a0038..df5a4538 100644
+--- a/src/server/handle.ts
++++ b/src/server/handle.ts
+@@ -43,7 +43,7 @@ import { resolveClaudeTranscriptLineage } from "../claude-transcript-lineage.js"
+ import { consumePluginRegisterFor, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginReportedModel, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, publicForkInputCheck, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "../plugin.js";
+ import { scheduleAffinityPersist } from "../affinity-persist.js";
+ import { evaluateChain, extractChainCarriers } from "../chain-checkpoint.js";
+-import { BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, googlePathKind, isLoopbackAddress, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, type WireProtocol } from "../util.js";
++import { BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, googlePathKind, isLoopbackAddress, reserveOutputHeadroom, resolveOutputHeadroomCap, rewrapAntigravityEnvelope, shouldReserveOutputHeadroom, unwrapAntigravityEnvelope, type WireProtocol } from "../util.js";
+ import { checkTunnelDestination, tunnelAllowlistFromEnv } from "../tunnel-guard.js";
+ import { resolveCompatDropFields } from "../compat-drop.js";
+ import { DecompressedTooLargeError, decodeRequestBody } from "../content-encoding.js";
+@@ -501,6 +501,20 @@ async function handleRequest(
+     //  index builds (each one re-converts the full history wire→core). The
+     //  predicate over-approximates by design; see bodyMightCarryImages.
+     const bodyMayCarryImages = protocol !== null && bodyText !== undefined ? bodyMightCarryImages(bodyText, protocol) : false;
++    // omp's google-antigravity provider sends the real Gemini body inside an
++    // envelope {project, model, request:{...}} (agent-wire antigravity shape).
++    // Every google consumer below (identity signal, affinity list, strip,
++    // prepareGoogle) reads `contents` at the TOP level, so an enveloped body
++    // resolves no conversation and dies with the #286 400. Unwrap here — the
++    // shell is re-applied on egress (see the runPreparedPipeline return).
++    const unwrapped = protocol === "google" ? unwrapAntigravityEnvelope(parsed) : { inner: parsed, shell: undefined };
++    const antigravityShell = unwrapped.shell;
++    if (antigravityShell !== undefined && unwrapped.inner !== parsed) {
++        parsed = unwrapped.inner;
++        const proj = typeof antigravityShell.project === "string" ? antigravityShell.project : "";
++        const mod = typeof antigravityShell.model === "string" ? antigravityShell.model : "";
++        log("info", `[google] unwrapped omp antigravity envelope (project=${proj || "?"} model=${mod || "?"}) — ${maskUrlForLog(req.url ?? "")}`);
++    }
+     // #903: inbound message count for the per-request cost line — messages
+     // (anthropic/openai) or input (responses); null when the body has neither.
+     const inboundMsgs: number | null = (() => {
+@@ -2545,7 +2559,11 @@ async function handleRequest(
+                     } catch (err) { logDumpFailure("INCOMING dump", err); }
+                 }
+                 logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0, prepared!.body);
+-                return { body: prepared!.body, prepared: prepared! };
++                // omp antigravity: the rebuilt GoogleRequestBody must go back
++                // inside the {project, model, request} envelope the upstream
++                // provider expects (the shell captured at inbound unwrap).
++                const egressBody = rewrapAntigravityEnvelope(antigravityShell, prepared!.body);
++                return { body: egressBody, prepared: prepared! };
+             };
+             // #1884/#2090 (un-armed signed traffic): a request that already
+             // carries a body-covering signature (SDK-HMAC-SHA256 family —
+diff --git a/src/util.ts b/src/util.ts
+index 046da22f..d110f728 100644
+--- a/src/util.ts
++++ b/src/util.ts
+@@ -644,3 +644,32 @@ function blockText(v: unknown): string | undefined {
+     }
+     return undefined;
+ }
++/**
++ * omp's google-antigravity provider sends its Gemini body inside an envelope
++ * `{project, model, request:{...}}` (agent-wire antigravity shape; the real
++ * GoogleRequestBody — contents/tools/systemInstruction — lives in `request`).
++ * The google adapter reads `contents` at the TOP level, so an enveloped body
++ * resolves no conversation and dies with the #286 400. Detect the envelope:
++ * top-level `request` object whose `contents` is an array, while the top level
++ * itself has NO `contents` array (a plain Gemini body has contents at top).
++ */
++export function unwrapAntigravityEnvelope(parsed: unknown): { inner: unknown; shell: Record<string, unknown> | undefined } {
++    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return { inner: parsed, shell: undefined };
++    const top = parsed as Record<string, unknown>;
++    if (Array.isArray(top.contents)) return { inner: parsed, shell: undefined };
++    const req = top.request;
++    if (req === null || typeof req !== "object" || Array.isArray(req)) return { inner: parsed, shell: undefined };
++    if (!Array.isArray((req as Record<string, unknown>).contents)) return { inner: parsed, shell: undefined };
++    return { inner: req, shell: top };
++}
++
++/** Re-wrap a rebuilt GoogleRequestBody into the omp antigravity envelope. */
++export function rewrapAntigravityEnvelope(shell: Record<string, unknown> | undefined, body: string | Buffer): string | Buffer {
++    if (!shell) return body;
++    try {
++        const inner = typeof body === "string" ? body : body.toString("utf8");
++        return JSON.stringify({ ...shell, request: JSON.parse(inner) });
++    } catch {
++        return body;
++    }
++}
+diff --git a/tests/antigravity-envelope.test.ts b/tests/antigravity-envelope.test.ts
+new file mode 100644
+index 00000000..c354ea2d
+--- /dev/null
++++ b/tests/antigravity-envelope.test.ts
+@@ -0,0 +1,80 @@
++import { test } from "node:test";
++import assert from "node:assert/strict";
++import { rewrapAntigravityEnvelope, unwrapAntigravityEnvelope } from "../src/util.ts";
++
++const ENVELOPED: Record<string, unknown> = {
++    project: "proj-123",
++    model: "gemini-3.8-flash",
++    request: {
++        contents: [{ role: "user", parts: [{ text: "hi" }] }],
++        systemInstruction: { parts: [{ text: "sys" }] },
++        sessionId: "sess-9",
++    },
++};
++
++test("unwrapAntigravityEnvelope: omp antigravity envelope yields the inner request + shell", () => {
++    const { inner, shell } = unwrapAntigravityEnvelope(ENVELOPED);
++    assert.ok(shell, "shell captured");
++    assert.equal(shell.project, "proj-123");
++    assert.equal(shell.model, "gemini-3.8-flash");
++    const req = inner as Record<string, unknown>;
++    assert.ok(Array.isArray(req.contents), "inner request has contents");
++    assert.equal((req.contents as unknown[]).length, 1);
++    assert.equal(req.sessionId, "sess-9", "inner fields preserved");
++});
++
++test("unwrapAntigravityEnvelope: plain google body (top-level contents) untouched", () => {
++    const plain = { contents: [{ role: "user", parts: [{ text: "hi" }] }], generationConfig: { temperature: 0.2 } };
++    const { inner, shell } = unwrapAntigravityEnvelope(plain);
++    assert.equal(shell, undefined, "no shell for plain google body");
++    assert.equal(inner, plain, "parsed body returned as-is");
++});
++
++test("unwrapAntigravityEnvelope: envelope without request.contents untouched", () => {
++    const weird = { project: "p", model: "m", request: { notContents: true } };
++    const { inner, shell } = unwrapAntigravityEnvelope(weird);
++    assert.equal(shell, undefined);
++    assert.equal(inner, weird);
++});
++
++test("unwrapAntigravityEnvelope: non-object / array input untouched", () => {
++    assert.equal(unwrapAntigravityEnvelope(null).inner, null);
++    assert.equal(unwrapAntigravityEnvelope("str").inner, "str");
++    const arr = [1, 2];
++    assert.equal(unwrapAntigravityEnvelope(arr).inner, arr, "array returned as-is");
++    assert.equal(unwrapAntigravityEnvelope(arr).shell, undefined, "array: shell undefined");
++});
++
++test("rewrapAntigravityEnvelope: plain body passes through unchanged", () => {
++    assert.equal(rewrapAntigravityEnvelope(undefined, "raw"), "raw");
++});
++
++test("rewrapAntigravityEnvelope: rebuilt google body goes back into the shell", () => {
++    const rebuilt = JSON.stringify({
++        contents: [{ role: "model", parts: [{ text: "compressed" }] }],
++        systemInstruction: { parts: [{ text: "client system" }, { text: "compress prompt" }] },
++    });
++    const out = rewrapAntigravityEnvelope(ENVELOPED, rebuilt);
++    assert.equal(typeof out, "string");
++    const parsed = JSON.parse(out as string) as Record<string, unknown>;
++    assert.equal(parsed.project, "proj-123", "project preserved");
++    assert.equal(parsed.model, "gemini-3.8-flash", "model preserved");
++    assert.equal("contents" in parsed, false, "no top-level contents in the envelope");
++    const req = parsed.request as Record<string, unknown>;
++    const contents = req.contents as Array<Record<string, unknown>>;
++    assert.equal(contents.length, 1);
++    assert.match(JSON.stringify(contents), /compressed/, "rebuilt body reached the request");
++    assert.match(JSON.stringify(req.systemInstruction ?? {}), /compress prompt/, "systemInstruction rebuilt");
++});
++
++test("rewrapAntigravityEnvelope: Buffer body handled", () => {
++    const out = rewrapAntigravityEnvelope(ENVELOPED, Buffer.from(JSON.stringify({ contents: [{ role: "user", parts: [] }] })));
++    const parsed = JSON.parse(out.toString()) as Record<string, unknown>;
++    assert.equal(parsed.project, "proj-123");
++    assert.ok(Array.isArray((parsed.request as Record<string, unknown>).contents));
++});
++
++test("rewrapAntigravityEnvelope: invalid inner JSON falls back to the raw body", () => {
++    const out = rewrapAntigravityEnvelope(ENVELOPED, "not-json");
++    assert.equal(out, "not-json");
++});
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,115 @@
+From 30a9a27d453f1a4e857a2087e6fa6b29e7d6808f Mon Sep 17 00:00:00 2001
+From: dingkaijian <dingkaijian@shizhuang-inc.com>
+Date: Sat, 10 Oct 2026 01:31:11 +0800
+Subject: [PATCH 4/5] google loop: rebuild antigravity-enveloped re-request
+ bodies INSIDE the shell
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The compress loop re-requests the upstream after a fold (round 1 refresh)
+and on truncation/degenerate/draft-tail retries via adapter.buildRequest.
+For omp's antigravity v1internal wire the body is {project, requestId,
+model, userAgent, requestType, request:{contents,...}}; the old code spread
+contents/systemInstruction onto the TOP level, and daily-cloudcode-pa
+rejected the unknown top-level fields with a 400 ("Unknown name contents",
+"Unknown name systemInstruction") — the exact error the user hit after
+the first re-request. unwrapAntigravityEnvelope now lifts the Gemini
+payload, the rebuilt contents/systemInstruction land inside request, and
+the shell is preserved. Plain Gemini bodies (top-level contents) are
+returned unchanged.
+---
+ src/loop/adapter-google.ts   | 10 +++++++--
+ tests/adapter-google.test.ts | 41 ++++++++++++++++++++++++++++++++++++
+ 2 files changed, 49 insertions(+), 2 deletions(-)
+
+diff --git a/src/loop/adapter-google.ts b/src/loop/adapter-google.ts
+index ee6076f4..4c48e78d 100644
+--- a/src/loop/adapter-google.ts
++++ b/src/loop/adapter-google.ts
+@@ -6,6 +6,7 @@ import { composeStreamFilters, createBiliArtifactFilter, createMarkerLineFilter,
+ import { degenerateTurnWarning } from "../degenerate-turn.js";
+ import { log as loggerLog } from "../logger.js";
+ import { normalizeSseLineEndings, finalizeSseLineEndings } from "../sse-util.js";
++import { unwrapAntigravityEnvelope } from "../util.js";
+ 
+ import type {
+     CompressLoopAdapter,
+@@ -287,7 +288,12 @@ export function createGoogleAdapter(
+             if (notes && notes.length > 0) {
+                 for (const text of notes) contents.push({ role: "user", parts: [{ text }] });
+             }
+-            const rebuilt: Record<string, unknown> = { ...body, contents };
++            // omp's antigravity envelope keeps the Gemini payload inside
++            // `request`; the rebuilt contents/systemInstruction must land
++            // INSIDE that shell — the v1internal wire rejects unknown
++            // top-level fields (contents/systemInstruction) with a 400.
++            const { inner, shell } = unwrapAntigravityEnvelope(body);
++            const rebuilt: Record<string, unknown> = { ...(inner as Record<string, unknown>), contents };
+             // The model lives in the URL path, `alt=sse` in the query, and the
+             // output cap in generationConfig.maxOutputTokens — a body carrying
+             // any of these keys is rejected upstream.
+@@ -298,7 +304,7 @@ export function createGoogleAdapter(
+                 .filter((p): p is string => typeof p === "string" && p.length > 0)
+                 .map((text) => ({ text }));
+             if (parts.length > 0) rebuilt.systemInstruction = { parts };
+-            return rebuilt;
++            return shell !== undefined ? { ...shell, request: rebuilt } : rebuilt;
+         },
+ 
+         async *parseStream(upstream, _round) {
+diff --git a/tests/adapter-google.test.ts b/tests/adapter-google.test.ts
+index d6065140..a57a8514 100644
+--- a/tests/adapter-google.test.ts
++++ b/tests/adapter-google.test.ts
+@@ -72,6 +72,47 @@ test("google buildRequest: contents + merged systemInstruction, request fields k
+     assert.equal("max_tokens" in body, false, "the output cap lives in generationConfig");
+ });
+ 
++test("google v1internal buildRequest: rebuilt contents/systemInstruction stay INSIDE the antigravity envelope", () => {
++    const ENVELOPE: Record<string, unknown> = {
++        project: "aicode-consumers",
++        requestId: "agent/agent-1/123/traj/0",
++        model: "gemini-3.8-flash-low",
++        userAgent: "antigravity",
++        requestType: "agent",
++        request: {
++            contents: [{ role: "user", parts: [{ text: "original" }] }],
++            systemInstruction: { role: "user", parts: [{ text: "sys" }] },
++            tools: [{ functionDeclarations: [{ name: "get_weather", description: "weather" }] }],
++            toolConfig: { functionCallingConfig: { mode: "VALIDATED" } },
++            generationConfig: { temperature: 0.7, maxOutputTokens: 8192 },
++            sessionId: "sess-1",
++            labels: { last_step_index: "0" },
++        },
++    };
++    const adapter = createGoogleAdapter(ENVELOPE, "client system", "bili_absorb", "gemini-3.8-flash-low", undefined, true);
++    const body = adapter.buildRequest(CORE_MESSAGES, "compress prompt", ENVELOPE);
++
++    assert.equal(body.project, "aicode-consumers", "shell project preserved");
++    assert.equal(body.requestId, "agent/agent-1/123/traj/0", "shell requestId preserved");
++    assert.equal(body.model, "gemini-3.8-flash-low", "shell model preserved");
++    assert.equal(body.userAgent, "antigravity", "shell userAgent preserved");
++    assert.equal(body.requestType, "agent", "shell requestType preserved");
++    assert.equal("contents" in body, false, "contents must NOT leak onto the shell (v1internal 400)");
++    assert.equal("systemInstruction" in body, false, "systemInstruction must NOT leak onto the shell (v1internal 400)");
++    const inner = body.request as Record<string, unknown>;
++    assert.ok(Array.isArray(inner.contents), "rebuilt contents live inside request");
++    assert.match(JSON.stringify(inner.contents), /fold the early history/, "user text reached the inner wire");
++    assert.deepEqual(
++        inner.systemInstruction,
++        { parts: [{ text: "client system" }, { text: "compress prompt" }] },
++        "merged systemInstruction lands inside request",
++    );
++    assert.deepEqual(inner.tools, (ENVELOPE.request as Record<string, unknown>).tools, "tools preserved inside request");
++    assert.deepEqual(inner.generationConfig, (ENVELOPE.request as Record<string, unknown>).generationConfig, "generationConfig preserved");
++    assert.deepEqual(inner.sessionId, "sess-1", "sessionId preserved");
++    assert.deepEqual(inner.labels, { last_step_index: "0" }, "labels preserved");
++});
++
+ test("google parseStream: SSE frames yield text, reasoning, tool_call, usage, done in order", async () => {
+     const events = await collect(
+         createGoogleAdapter({}, undefined, undefined, "gemini-3-pro-preview"),
+-- 
+2.54.0 (Apple Git-157)
+

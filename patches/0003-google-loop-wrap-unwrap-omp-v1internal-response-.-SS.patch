@@ -1,0 +1,620 @@
+From a1b8749cad39b6a9afd6daa04670c37ba9d7a1b7 Mon Sep 17 00:00:00 2001
+From: dingkaijian <dingkaijian@shizhuang-inc.com>
+Date: Sat, 24 Oct 2026 17:32:58 +0800
+Subject: [PATCH 3/5] google loop: wrap/unwrap omp v1internal {response:...}
+ SSE shell
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+omp's antigravity wire calls /v1internal:streamGenerateContent (no
+/models/<model>: segment) and nests every chunk as {"response":{...}};
+the client reads Ie.response.candidates/finishReason/usageMetadata.
+
+- util.ts: googleV1InternalPath() — shared by handle.ts dispatch and
+  native-intercept.ts so wire-classification and URL-shape gate stay in
+  lockstep; googlePathKind still classifies it stream-generate. Also
+  antigravityFrameView()/rewrapAntigravityFrame() for the RESPONSE shell.
+- Prepared.google.v1internal: prepareGoogle reads handle's urlPath and
+  passes it through; pickAdapter hands it to createGoogleAdapter.
+- adapter-google: parseStream unwraps the response shell before reading
+  candidates/promptFeedback/usageMetadata; every rebuilt chunk (edited
+  text, thought, finish stub, settle replay, prose rebuild, emit*)
+  is re-shelled via wrapObj/wrapFrame. Passthrough frames keep the
+  upstream bytes (shell intact), error frames stay top-level.
+- plugin.ts: the plugin-lane strip pipe reads google frames through
+  antigravityFrameView too — processGoogle (tag filtering, finishReason),
+  the SSE terminal diagnostics and googleUsageSample all looked at
+  top-level candidates only, so a finished shelled turn was misreported
+  as "upstream stream ended before a completion event" and its usage
+  never settled. Rebuilds are re-wrapped into the same shell.
+- tests: v1internal shell round-trip, edited rebuild re-shell, settle
+  keep-replay, top-level error passthrough, plugin pipe terminates a
+  shelled stream without the in-band truncation error.
+---
+ src/loop/adapter-google.ts                |  39 +++++--
+ src/loop/index.ts                         |   4 +-
+ src/plugin.ts                             |  29 +++--
+ src/server.ts                             |   2 +-
+ src/server/handle.ts                      |   6 +-
+ src/server/prepare-google.ts              |   3 +-
+ src/util.ts                               |  31 ++++++
+ tests/adapter-google.test.ts              | 100 +++++++++++++++++
+ tests/fix-v1internal-google-shell.test.ts | 126 ++++++++++++++++++++++
+ 9 files changed, 316 insertions(+), 24 deletions(-)
+ create mode 100644 tests/fix-v1internal-google-shell.test.ts
+
+diff --git a/src/loop/adapter-google.ts b/src/loop/adapter-google.ts
+index ab5e3f1c..ee6076f4 100644
+--- a/src/loop/adapter-google.ts
++++ b/src/loop/adapter-google.ts
+@@ -245,16 +245,26 @@ export function createGoogleAdapter(
+     absorbName?: string,
+     model?: string,
+     notes?: string[],
++    v1internal = false,
+ ): CompressLoopAdapter {
+     // Gemini carries the model in the URL path, not the body, so the server
+     // hands it in; the body lookup only covers hand-built requests.
+     const modelVersion = model ?? (typeof requestBody.model === "string" ? requestBody.model : undefined);
+ 
++    // omp's antigravity wire (`/v1internal:streamGenerateContent`) wraps every
++    // upstream chunk as `{"response":{...}}`; the client only reads
++    // `Ie.response.candidates/finishReason/usageMetadata`. Every rebuilt frame
++    // must keep that shell, while upstream frames are passed through verbatim
++    // (they already carry it) and error frames stay top-level.
++    const wrapObj = (obj: Record<string, unknown>): Record<string, unknown> =>
++        v1internal ? { response: obj } : obj;
++    const wrapFrame = (obj: Record<string, unknown>): Buffer => sseFrame(wrapObj(obj));
++
+     const buildChunk = (
+         parts: GooglePart[],
+         extra: { candidate?: Record<string, unknown>; top?: Record<string, unknown> } = {},
+     ): Buffer =>
+-        sseFrame({
++        wrapFrame({
+             ...(modelVersion ? { modelVersion } : {}),
+             candidates: [{ content: { role: "model", parts }, index: 0, ...(extra.candidate ?? {}) }],
+             ...(extra.top ?? {}),
+@@ -454,7 +464,7 @@ export function createGoogleAdapter(
+                     if (filtered === "keep") {
+                         yield { kind: "meta", chunk: Buffer.from(`data: ${json}\n\n`, "utf8") } as ParsedStreamEvent;
+                     } else if (filtered !== null) {
+-                        yield { kind: "meta", chunk: sseFrame(filtered) } as ParsedStreamEvent;
++                        yield { kind: "meta", chunk: wrapFrame(filtered) } as ParsedStreamEvent;
+                     } else {
+                         // #1881: proxy-only chunk — its frame is dropped, but
+                         // its withheld prose still has to reach the client.
+@@ -490,6 +500,17 @@ export function createGoogleAdapter(
+                 } catch {
+                     continue;
+                 }
++                // omp's v1internal wire nests the standard chunk fields under
++                // `response`; unwrap so the logic below sees plain candidates/
++                // promptFeedback/usageMetadata. Frames without a `response`
++                // object (e.g. an error frame) stay untouched and fall through
++                // to the passthrough branches as-is.
++                if (v1internal) {
++                    const inner = parsed.response;
++                    if (inner !== null && typeof inner === "object" && !Array.isArray(inner)) {
++                        parsed = inner as Record<string, unknown>;
++                    }
++                }
+                 const rawBuf = Buffer.from(`${frame}\n\n`, "utf8");
+                 const candidates = parsed.candidates as Array<Record<string, unknown>> | undefined;
+                 const candidate = candidates?.[0];
+@@ -561,7 +582,7 @@ export function createGoogleAdapter(
+                         let raw: Buffer | undefined;
+                         // A chunk that also carries functionCall parts is replayed
+                         // whole at settle, so its text must not be forwarded twice.
+-                        if (!hasCallPart) raw = finishReason ? sseFrame(cloneChunk(parsed, { dropFinishReason: true })) : rawBuf;
++                        if (!hasCallPart) raw = finishReason ? wrapFrame(cloneChunk(parsed, { dropFinishReason: true })) : rawBuf;
+                         yield {
+                             kind: "reasoning",
+                             delta: part.text,
+@@ -579,11 +600,11 @@ export function createGoogleAdapter(
+                     if (clean === part.text) {
+                         // A chunk that also carries functionCall parts is replayed
+                         // whole at settle, so its text must not be forwarded twice.
+-                        if (!hasCallPart) raw = finishReason ? sseFrame(cloneChunk(parsed, { dropFinishReason: true })) : rawBuf;
++                        if (!hasCallPart) raw = finishReason ? wrapFrame(cloneChunk(parsed, { dropFinishReason: true })) : rawBuf;
+                     } else {
+                         editedParts = (editedParts ?? [...parts]).map((p, j) => (j === i ? { ...p, text: clean } : p));
+                         if (!hasCallPart) {
+-                            raw = sseFrame(cloneChunk(parsed, {
++                            raw = wrapFrame(cloneChunk(parsed, {
+                                 parts: parts
+                                     .map((p, j) => (j === i ? { ...p, text: clean } : p))
+                                     .filter((p) => !p || typeof p !== "object" || p.functionCall === undefined),
+@@ -595,7 +616,11 @@ export function createGoogleAdapter(
+                 }
+                 if (callIndexes.length > 0) {
+                     const storedParsed = editedParts ? cloneChunk(parsed, { parts: editedParts }) : parsed;
+-                    rawCallChunks.push({ json: editedParts ? JSON.stringify(storedParsed) : json, parsed: storedParsed, callIndexes });
++                    // The edited replay is rebuilt from the unwrapped inner
++                    // chunk, so it must be re-shelled for v1internal; the
++                    // unedited path keeps the upstream frame's own `json`
++                    // (which already carries the shell) byte-identical.
++                    rawCallChunks.push({ json: editedParts ? JSON.stringify(wrapObj(storedParsed)) : json, parsed: storedParsed, callIndexes });
+                 }
+                 // #3158: standalone thoughtSignature parts modeled no event above
+                 // and vanished from the client's stream. When nothing else in the
+@@ -651,7 +676,7 @@ export function createGoogleAdapter(
+                         // so the stub carries NO parts — resending them duplicates
+                         // the prose on the wire.
+                         const finishHasCall = parts.some((p) => p && typeof p === "object" && p.functionCall !== undefined);
+-                        const finishChunk = finishHasCall ? sseFrame(cloneChunk(parsed, { parts: [] })) : rawBuf;
++                        const finishChunk = finishHasCall ? wrapFrame(cloneChunk(parsed, { parts: [] })) : rawBuf;
+                         yield { kind: "meta", chunk: finishChunk } as ParsedStreamEvent;
+                         yield { kind: "done", finishReason, suppressCompletion: true, ...(truncated ? { truncated: true } : {}) } as ParsedStreamEvent;
+                     } else {
+diff --git a/src/loop/index.ts b/src/loop/index.ts
+index 5f5ca938..2bdee9bf 100644
+--- a/src/loop/index.ts
++++ b/src/loop/index.ts
+@@ -28,7 +28,7 @@ export function pickAdapter(
+     anthropicSystem?: AnthropicRequestBody["system"],
+     openaiSystem?: string,
+     absorbName?: string,
+-    google?: { system?: string; model?: string },
++    google?: { system?: string; model?: string; v1internal?: boolean },
+     systemNotes?: string[],
+     streamErrorShape?: "protocol" | "completion",
+     anthropicCacheMarks?: Map<string, { type: "ephemeral" }>,
+@@ -41,6 +41,6 @@ export function pickAdapter(
+     if (protocol === "responses") return createResponsesAdapter(textProtocol, responsesProjection, absorbName, systemNotes);
+     if (protocol === "openai") return createOpenaiAdapter(requestBody, openaiSystem, absorbName, systemNotes, shape);
+     if (protocol === "anthropic") return createAnthropicAdapter(requestBody, anthropicSystem, systemNotes, shape, anthropicCacheMarks, anthropicClientCacheControls, absorbArmed);
+-    if (protocol === "google") return createGoogleAdapter(requestBody, google?.system, absorbName, google?.model, systemNotes);
++    if (protocol === "google") return createGoogleAdapter(requestBody, google?.system, absorbName, google?.model, systemNotes, google?.v1internal);
+     throw new Error(`[acp-loop] unknown protocol: ${protocol}`);
+ }
+diff --git a/src/plugin.ts b/src/plugin.ts
+index e04a08b7..b7219ee7 100644
+--- a/src/plugin.ts
++++ b/src/plugin.ts
+@@ -63,7 +63,7 @@ import { describeAdvisory, getAdvisoryState } from "./advisory.js";
+ import { describeUpdateReady, getUpdateVisibility } from "./update-notes.js";
+ import { warnCacheCollapse } from "./cache-warn.js";
+ import { currentContextObservation, recordContextObservation, settleUsageReport } from "./cache-ledger.js";
+-import { promptInputTotal, type WireProtocol } from "./util.js";
++import { antigravityFrameView, promptInputTotal, rewrapAntigravityFrame, type WireProtocol } from "./util.js";
+ import { stateDir } from "./paths.js";
+ import { lookupToolWitness, recordToolWitness } from "./tool-ring.js";
+ import { awaitDrain } from "./server/stream-io.js";
+@@ -2049,7 +2049,8 @@ function num(v: unknown): number | undefined {
+  *  context (the `cachedContentTokenCount` prefix included) and thinking tokens
+  *  are billed ON TOP of the candidate's, so both count as output. */
+ function googleUsageSample(obj: Record<string, unknown>): UsageSample | undefined {
+-    const meta = obj["usageMetadata"];
++    // v1internal frames carry the Gemini payload under `response`.
++    const meta = antigravityFrameView(obj).view["usageMetadata"];
+     if (!meta || typeof meta !== "object") return undefined;
+     const u = meta as Record<string, unknown>;
+     const cand = num(u["candidatesTokenCount"]);
+@@ -2976,12 +2977,15 @@ export async function pipePluginChatWithStrip(
+      *  choices/content blocks — one filter keyed per (candidate index, field) —
+      *  and a `finishReason` chunk is this wire's terminal event. */
+     const processGoogle = (ev: Record<string, unknown>, rawEvent: string): string => {
+-        if (typeof ev["modelVersion"] === "string") lastChunkMeta = { ...lastChunkMeta, modelVersion: ev["modelVersion"] };
++        // Antigravity nests the Gemini payload under `response`; inspect the
++        // inner object and re-wrap every rebuild into the same shell.
++        const { view: gv, shell: gShell } = antigravityFrameView(ev);
++        if (typeof gv["modelVersion"] === "string") lastChunkMeta = { ...lastChunkMeta, modelVersion: gv["modelVersion"] };
+         // A top-level `error` object is Gemini's other terminal shape (HTTP-level
+         // failures arrive mid-stream too): the client throws on it, so the turn
+         // is over and must not also be reported as an upstream truncation.
+-        if (ev["error"] !== undefined) sawTerminal = true;
+-        const candidates = ev["candidates"];
++        if (gv["error"] !== undefined) sawTerminal = true;
++        const candidates = gv["candidates"];
+         if (!Array.isArray(candidates)) {
+             // #2248: raw exit — non-candidates frames never enter the filter.
+             auditRawForward(rawEvent);
+@@ -3101,7 +3105,7 @@ export async function pipePluginChatWithStrip(
+                     // parsed event (callers keep `ev` for logs/usage).
+                     if (!rebuilt) {
+                         rebuilt = {
+-                            ...ev,
++                            ...gv,
+                             candidates: candidates.map((c) => {
+                                 if (!c || typeof c !== "object") return c;
+                                 const cand = { ...(c as Record<string, unknown>) };
+@@ -3129,12 +3133,12 @@ export async function pipePluginChatWithStrip(
+             // finishReason / functionCall / usageMetadata sibling must survive,
+             // the chat processor's #463 rule).
+             if (droppedText && !keptText && !googleFrameHasNonText(rebuilt)) return "";
+-            return drain + rebuildEvent(rawEvent, rebuilt);
++            return drain + rebuildEvent(rawEvent, rewrapAntigravityFrame(gShell, rebuilt));
+         }
+         // #2248: raw exit — text outside managed parts never enters the filter.
+         // Frames carrying non-text parts (functionCall/functionResponse, ...) hold
+         // structured or user data (#1039) and are excluded from the audit.
+-        if (!googleFrameHasNonText(ev)) auditRawForward(rawEvent);
++        if (!googleFrameHasNonText(gv)) auditRawForward(rawEvent);
+         if (drain.length > 0) return drain + rawEvent + "\n\n";
+         if (!hadText && anyPending()) return flushTails() + rawEvent + "\n\n";
+         return rawEvent + "\n\n";
+@@ -3188,6 +3192,10 @@ export async function pipePluginChatWithStrip(
+                         continue;
+                     }
+                     diagEvents++;
++                    // Antigravity (v1internal) frames nest the Gemini payload
++                    // under `response`: every reader below must inspect that
++                    // view or it sees no candidates/usage at all (#v1internal).
++                    const googleView = protocol === "google" ? antigravityFrameView(ev).view : undefined;
+                     // #2328: wire-native label where one exists; the chat wires
+                     // without a `type` get a synthesized one so the last-events
+                     // trail is readable in the diag.
+@@ -3197,7 +3205,8 @@ export async function pipePluginChatWithStrip(
+                         const fr = c0 && typeof c0 === "object" ? (c0 as Record<string, unknown>)["finish_reason"] : undefined;
+                         diagPushType(typeof fr === "string" ? `chunk:finish=${fr}` : "chunk");
+                     } else if (protocol === "google") {
+-                        const c0 = Array.isArray(ev["candidates"]) ? (ev["candidates"] as unknown[])[0] : undefined;
++                        const gc = googleView ? googleView["candidates"] : undefined;
++                        const c0 = Array.isArray(gc) ? (gc as unknown[])[0] : undefined;
+                         const fr = c0 && typeof c0 === "object" ? (c0 as Record<string, unknown>)["finishReason"] : undefined;
+                         diagPushType(typeof fr === "string" ? `chunk:finish=${fr}` : "chunk");
+                     } else diagPushType("frame");
+@@ -3234,7 +3243,7 @@ export async function pipePluginChatWithStrip(
+                         // #732/#821 machinery reaches this wire. finalFinishReason
+                         // keeps the raw value for diag/warn (processGoogle sets it
+                         // to the same value below).
+-                        const candidates = ev["candidates"];
++                        const candidates = googleView ? googleView["candidates"] : undefined;
+                         if (Array.isArray(candidates)) {
+                             for (const c of candidates) {
+                                 const fr = c && typeof c === "object" ? (c as Record<string, unknown>)["finishReason"] : undefined;
+diff --git a/src/server.ts b/src/server.ts
+index 5cc98d99..bb5bef29 100644
+--- a/src/server.ts
++++ b/src/server.ts
+@@ -1555,7 +1555,7 @@ export type Prepared = {
+      *  it out of the fold space) and the path-derived model. Both are needed to
+      *  rebuild `systemInstruction` and to synthesize chunks on every compress
+      *  loop round. */
+-    google?: { system?: string; model?: string };
++    google?: { system?: string; model?: string; v1internal?: boolean };
+     /** #1085: stable-system-anchor update notes for this turn — re-injected
+      *  as trailing user messages so compress-loop rounds see the same
+      *  updated-instructions context the main request did. */
+diff --git a/src/server/handle.ts b/src/server/handle.ts
+index df5a4538..fae9b8b8 100644
+--- a/src/server/handle.ts
++++ b/src/server/handle.ts
+@@ -43,7 +43,7 @@ import { resolveClaudeTranscriptLineage } from "../claude-transcript-lineage.js"
+ import { consumePluginRegisterFor, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginReportedModel, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, publicForkInputCheck, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "../plugin.js";
+ import { scheduleAffinityPersist } from "../affinity-persist.js";
+ import { evaluateChain, extractChainCarriers } from "../chain-checkpoint.js";
+-import { BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, googlePathKind, isLoopbackAddress, reserveOutputHeadroom, resolveOutputHeadroomCap, rewrapAntigravityEnvelope, shouldReserveOutputHeadroom, unwrapAntigravityEnvelope, type WireProtocol } from "../util.js";
++import { BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, googlePathKind, googleV1InternalPath, isLoopbackAddress, reserveOutputHeadroom, resolveOutputHeadroomCap, rewrapAntigravityEnvelope, shouldReserveOutputHeadroom, unwrapAntigravityEnvelope, type WireProtocol } from "../util.js";
+ import { checkTunnelDestination, tunnelAllowlistFromEnv } from "../tunnel-guard.js";
+ import { resolveCompatDropFields } from "../compat-drop.js";
+ import { DecompressedTooLargeError, decodeRequestBody } from "../content-encoding.js";
+@@ -2328,11 +2328,11 @@ async function handleRequest(
+                     if (protocol === "google") {
+                         // Both the model and the stream flag live in the URL path
+                         // for this wire (the body carries neither), so they are
+-                        // derived here instead of read off `work`. #3280: on the
++// derived here instead of read off `work`. #3280: on the
+                         // v1internal dialect the model rides in the envelope meta
+                         // instead of the path — fall back to it so Prepared carries
+                         // a real model (the loop's synthetic frames read it back).
+-                        return await prepareGoogle(work as GoogleRequestBody, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, nativeWindow, googleModel ?? v1Model, googlePathKind(urlPath) === "stream-generate", visibilityMarkers, upstreamOrigin, req, decide);
++                        return await prepareGoogle(work as GoogleRequestBody, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, nativeWindow, googleModel ?? v1Model, googlePathKind(urlPath) === "stream-generate", googleV1InternalPath(urlPath), visibilityMarkers, upstreamOrigin, req, decide);
+                     }
+                     const preparedOut = protocol === "anthropic"
+                         ? await prepareAnthropic(work as AnthropicRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, reasoningCfg, visibilityMarkers, requestModel, decide)
+diff --git a/src/server/prepare-google.ts b/src/server/prepare-google.ts
+index 0cd9ed03..cebc8e6e 100644
+--- a/src/server/prepare-google.ts
++++ b/src/server/prepare-google.ts
+@@ -72,6 +72,7 @@ export async function prepareGoogle(
+     nativeWindow: number,
+     model: string | undefined,
+     stream: boolean,
++    v1internal: boolean,
+     visibilityMarkers: boolean,
+     upstreamOrigin: string,
+     req: http.IncomingMessage,
+@@ -371,7 +372,7 @@ export async function prepareGoogle(
+     }
+     snapshotMessages(session, originalMessages);
+     markDirty(session);
+-    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, protocol: "google", stream, compressInjected: injectTools, pluginMode, nudge, nudgeOutcome, prompts, surface, google: { system: googleClientSystem, model }, systemNotes: sysNotes, renderTags: renderStrategy } as Prepared;
++    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, protocol: "google", stream, compressInjected: injectTools, pluginMode, nudge, prompts, surface, google: { system: googleClientSystem, model, v1internal }, systemNotes: sysNotes, renderTags: renderStrategy } as Prepared;
+ }
+ 
+ /** `POST /v1beta/models/<model>:countTokens` — the fold-prune twin of
+diff --git a/src/util.ts b/src/util.ts
+index d110f728..021c4825 100644
+--- a/src/util.ts
++++ b/src/util.ts
+@@ -148,6 +148,19 @@ export function googlePathKind(urlPath: string): GooglePathKind | null {
+     return null;
+ }
+ 
++/**
++ * omp's antigravity wire calls the model API through `/v1internal:streamGenerateContent`
++ * (no `/models/<model>:` segment) and wraps every SSE chunk as
++ * `{"response":{...}}`; the loop adapter needs to know which chunk shape it
++ * will see. Shared by server.ts (prepare dispatch) and agent/native-intercept.ts
++ * (URL-shape gate) — keep one definition so the two cannot drift apart.
++ * Note: `googlePathKind` still classifies this path as "stream-generate", so
++ * protocol detection needs no change; this flag only selects the chunk shape.
++ */
++export function googleV1InternalPath(urlPath: string): boolean {
++    return urlPath.split("?")[0].includes("/v1internal:");
++}
++
+ /**
+  * Compute the true TOTAL input-token count and the cached subset from a
+  * protocol-native `usage` object.
+@@ -663,6 +676,24 @@ export function unwrapAntigravityEnvelope(parsed: unknown): { inner: unknown; sh
+     return { inner: req, shell: top };
+ }
+ 
++/**
++ * The RESPONSE side of the same envelope: antigravity's v1internal stream
++ * frames every Gemini chunk as `{"response":{candidates,...}}` (the shell also
++ * carries `traceId`/`metadata`). Readers that inspect a frame — usage, finish
++ * reason, tag-echo filtering — must look at the inner object; a frame without
++ * the shell is returned as its own view so plain Gemini bodies keep working.
++ */
++export function antigravityFrameView(frame: Record<string, unknown>): { view: Record<string, unknown>; shell: Record<string, unknown> | undefined } {
++    const resp = frame.response;
++    if (resp === null || typeof resp !== "object" || Array.isArray(resp)) return { view: frame, shell: undefined };
++    return { view: resp as Record<string, unknown>, shell: frame };
++}
++
++/** Re-wrap a rebuilt stream frame so it keeps the antigravity shell shape. */
++export function rewrapAntigravityFrame(shell: Record<string, unknown> | undefined, rebuilt: Record<string, unknown>): Record<string, unknown> {
++    return shell ? { ...shell, response: rebuilt } : rebuilt;
++}
++
+ /** Re-wrap a rebuilt GoogleRequestBody into the omp antigravity envelope. */
+ export function rewrapAntigravityEnvelope(shell: Record<string, unknown> | undefined, body: string | Buffer): string | Buffer {
+     if (!shell) return body;
+diff --git a/tests/adapter-google.test.ts b/tests/adapter-google.test.ts
+index ac3c7f6d..d6065140 100644
+--- a/tests/adapter-google.test.ts
++++ b/tests/adapter-google.test.ts
+@@ -349,3 +349,103 @@ test("google parseStream: a null sibling part does not break the edited frame",
+     const frames = framesOf(events);
+     assert.ok(frames.some((f) => f.includes("kept prose")), `the prose still reaches the client, got: ${frames.join(" | ")}`);
+ });
++
++// ---- omp antigravity wire: /v1internal:streamGenerateContent --------------
++// The client nests every chunk under `{"response":{...}}` and only reads
++// `Ie.response.candidates/finishReason/usageMetadata`. The adapter unwraps
++// upstream frames internally and must re-shell every chunk it rebuilds;
++// frames that pass through verbatim keep their original (already-shelled)
++// bytes, and error frames stay top-level.
++
++const V1 = (inner: Record<string, unknown>): Record<string, unknown> => ({ response: inner });
++const responseOf = (parsed: Record<string, unknown>): Record<string, unknown> => {
++    const shell = parsed.response as Record<string, unknown> | undefined;
++    assert.ok(shell && typeof shell === "object", `frame carries the response shell: ${JSON.stringify(parsed).slice(0, 80)}`);
++    return shell;
++};
++
++test("google parseStream v1internal: unwraps {response:...} frames, passthrough keeps the shell", async () => {
++    const events = await collect(
++        createGoogleAdapter({}, undefined, undefined, "gemini-3-pro-preview", undefined, true),
++        sse(V1({ candidates: [{ content: { role: "model", parts: [{ text: "Hello " }] }, index: 0 }] })) +
++            sse(V1({ candidates: [{ content: { role: "model", parts: [{ thought: true, text: "weighing", thoughtSignature: "sig-1" }] }, index: 0 }] })) +
++            sse(V1({ candidates: [{ content: { role: "model", parts: [] }, finishReason: "STOP", index: 0 }], usageMetadata: { promptTokenCount: 11, candidatesTokenCount: 2 } })),
++    );
++    assert.deepEqual(events.map((e) => e.kind), ["text", "reasoning", "usage", "done"], "chunk shape does not disturb event order");
++    const text = events[0];
++    assert.ok(text.kind === "text" && text.delta === "Hello " && text.raw, "text delta with passthrough raw");
++    if (text.kind === "text" && text.raw) {
++        const parts = responseOf(frameJson(text.raw)).candidates[0].content.parts;
++        assert.equal(parts[0].text, "Hello ", "passthrough frame keeps the upstream shell");
++    }
++    const reason = events[1];
++    assert.ok(reason.kind === "reasoning" && reason.delta === "weighing" && reason.raw, "reasoning delta with passthrough raw");
++    if (reason.kind === "reasoning" && reason.raw) {
++        const parts = responseOf(frameJson(reason.raw)).candidates[0].content.parts;
++        assert.equal(parts[0].text, "weighing");
++        assert.equal(parts[0].thought, true, "reasoning part survives the shell round-trip");
++    }
++    const usage = events[2];
++    assert.ok(usage.kind === "usage", "usage event");
++    if (usage.kind === "usage") {
++        assert.equal(usage.inputTokens, 11);
++        assert.equal(usage.outputTokens, 2);
++    }
++    const done = events[3];
++    assert.ok(done.kind === "done" && done.finishReason === "STOP", "done terminates the stream");
++});
++
++test("google parseStream v1internal: an edited text frame is rebuilt and re-shelled", async () => {
++    // The tag-filtered copy is rebuilt by the adapter (parts replaced,
++    // finishReason dropped) — it must come out wrapped in `response` again.
++    const TAG = "\x3cacp tokens=\"1\" type=\"text\"\x3e";
++    const CLOSE = "\x3c/acp\x3e";
++    const events = await collect(
++        createGoogleAdapter({}, undefined, undefined, "gemini-3-pro-preview", undefined, true),
++        sse(V1({ candidates: [{ content: { role: "model", parts: [{ text: `${TAG}m00001${CLOSE}final ` }] }, index: 0 }] })),
++    );
++    assert.deepEqual(events.map((e) => e.kind), ["text"], "edited text is forwarded as a text event");
++    const text = events[0];
++    assert.ok(text.kind === "text" && text.delta === "final " && text.raw, "edited delta with rebuilt raw");
++    if (text.kind === "text" && text.raw) {
++        const shell = responseOf(frameJson(text.raw));
++        const parts = shell.candidates[0].content.parts;
++        assert.equal(parts[0].text, "final ", "rebuilt frame carries the clean bytes");
++        assert.equal(shell.candidates[0].finishReason, undefined, "dropped finishReason stays dropped inside the shell");
++    }
++});
++
++test("google parseStream v1internal: settle replay keeps the shelled call frame", async () => {
++    const events = await collect(
++        createGoogleAdapter({}, undefined, undefined, "gemini-3-pro-preview", undefined, true),
++        sse(V1({ candidates: [{ content: { role: "model", parts: [{ functionCall: { name: "get_weather", args: { city: "x" }, id: "call_2" } }] }, index: 0 }] })) +
++            sse(V1({ candidates: [{ content: { role: "model", parts: [] }, finishReason: "STOP", index: 0 }] })),
++    );
++    const kinds = events.map((e) => e.kind);
++    assert.ok(kinds.includes("tool_call") && kinds.includes("meta") && kinds.includes("done"), `kinds: ${kinds.join(",")}`);
++    const call = events.find((e) => e.kind === "tool_call");
++    assert.ok(call && call.kind === "tool_call", "real call surfaced");
++    if (call && call.kind === "tool_call") {
++        assert.equal(call.name, "get_weather");
++        assert.equal(call.callId, "call_2");
++        assert.equal(call.passthrough, true, "real call is raw-replayed for the client");
++    }
++    const replay = events.find((e) => e.kind === "meta");
++    assert.ok(replay?.chunk, "settle replay has a chunk");
++    if (replay?.chunk) {
++        // settle "keep" replay: original upstream bytes, shell intact
++        const parts = responseOf(frameJson(replay.chunk)).candidates[0].content.parts;
++        assert.equal(parts[0].functionCall.name, "get_weather", "settle replay keeps the shelled call frame");
++    }
++});
++
++test("google parseStream v1internal: a top-level error frame passes through un-shelled", async () => {
++    const events = await collect(
++        createGoogleAdapter({}, undefined, undefined, "gemini-3-pro-preview", undefined, true),
++        sse({ error: { code: 500, message: "boom", status: "INTERNAL" } }),
++    );
++    assert.deepEqual(events.map((e) => e.kind), ["meta"], "error frame is handed through as a passthrough meta chunk");
++    const parsed = frameJson(events[0].chunk);
++    assert.equal(parsed.error?.status, "INTERNAL", "error payload intact");
++    assert.equal("response" in parsed, false, "no shell added to an error frame");
++});
+diff --git a/tests/fix-v1internal-google-shell.test.ts b/tests/fix-v1internal-google-shell.test.ts
+new file mode 100644
+index 00000000..836f00f2
+--- /dev/null
++++ b/tests/fix-v1internal-google-shell.test.ts
+@@ -0,0 +1,126 @@
++import { test } from "node:test";
++import assert from "node:assert/strict";
++import type { ServerResponse } from "node:http";
++import { pipePluginChatWithStrip } from "../src/plugin.ts";
++import { antigravityFrameView, rewrapAntigravityFrame } from "../src/util.ts";
++
++// omp's google-antigravity provider streams v1internal frames, i.e. every
++// Gemini chunk arrives wrapped in `{"response":{candidates,...}}`. The plugin
++// passthrough used to read top-level `candidates`/`usageMetadata` only, so a
++// perfectly terminated shelled turn looked like "no terminal event ever seen"
++// and the client got the in-band truncation error instead of the answer.
++
++function makeRes(chunks: string[]) {
++    return {
++        writes: chunks,
++        write(b: Buffer | string) {
++            chunks.push(typeof b === "string" ? b : b.toString("utf8"));
++            return true;
++        },
++        end(b?: Buffer | string) {
++            if (b !== undefined) chunks.push(typeof b === "string" ? b : b.toString("utf8"));
++        },
++        once() {},
++        destroyed: false,
++        writableEnded: false,
++    } as unknown as ServerResponse;
++}
++
++function streamOf(events: string[]): ReadableStream<Uint8Array> {
++    const enc = new TextEncoder();
++    let i = 0;
++    return new ReadableStream<Uint8Array>({
++        pull(controller) {
++            if (i < events.length) {
++                controller.enqueue(enc.encode(events[i]));
++                i += 1;
++            } else {
++                controller.close();
++            }
++        },
++    });
++}
++
++const shelled = (inner: Record<string, unknown>) => `data: ${JSON.stringify({ response: inner, traceId: "t-1" })}\n\n`;
++const plain = (inner: Record<string, unknown>) => `data: ${JSON.stringify(inner)}\n\n`;
++
++const textFrame = (text: string) => shelled({ candidates: [{ index: 0, content: { role: "model", parts: [{ text }] } }] });
++const finishFrame = (reason: string) => shelled({ candidates: [{ index: 0, finishReason: reason }], usageMetadata: { promptTokenCount: 11, candidatesTokenCount: 3, totalTokenCount: 14 } });
++
++function frames(writes: string[]): Array<Record<string, unknown>> {
++    const out: Array<Record<string, unknown>> = [];
++    for (const w of writes) {
++        for (const frame of w.split("\n\n")) {
++            const m = frame.match(/^data: (.*)$/m);
++            if (!m) continue;
++            try {
++                out.push(JSON.parse(m[1]!) as Record<string, unknown>);
++            } catch {
++                /* not a JSON frame */
++            }
++        }
++    }
++    return out;
++}
++
++function hasTruncation(writes: string[]): boolean {
++    return frames(writes).some((ev) => {
++        const err = ev["error"] as Record<string, unknown> | undefined;
++        return !!err && (err["status"] === "UNAVAILABLE" || err["message"] === "upstream stream ended before a completion event; this turn may be incomplete");
++    });
++}
++
++test("frame view: shelled payload is inspected inside `response`, plain bodies unchanged", () => {
++    const inner = { candidates: [{ finishReason: "STOP" }] };
++    const shelledFrame = { response: inner, traceId: "t" };
++    const a = antigravityFrameView(shelledFrame);
++    assert.equal(a.view, inner);
++    assert.equal(a.shell, shelledFrame);
++    assert.deepEqual(rewrapAntigravityFrame(a.shell, { candidates: [] }), { response: { candidates: [] }, traceId: "t" });
++
++    const b = antigravityFrameView(inner);
++    assert.equal(b.view, inner);
++    assert.equal(b.shell, undefined);
++    assert.deepEqual(rewrapAntigravityFrame(b.shell, { candidates: [] }), { candidates: [] });
++});
++
++test("chat pipe (google, v1internal shell): a terminated shelled turn is forwarded, not reported as a truncation", async () => {
++    const out: string[] = [];
++    await pipePluginChatWithStrip(
++        streamOf([textFrame("hello"), finishFrame("STOP")]),
++        makeRes(out),
++        "google",
++    );
++    const parsed = frames(out);
++    assert.equal(hasTruncation(out), false, "no in-band truncation for a stream that ended with finishReason");
++    const text = parsed
++        .map((ev) => ((ev["response"] as Record<string, unknown> | undefined)?.["candidates"] as Array<Record<string, unknown>> | undefined)?.[0])
++        .map((c) => ((c?.["content"] as Record<string, unknown> | undefined)?.["parts"] as Array<Record<string, unknown>> | undefined)?.[0]?.["text"])
++        .filter((t): t is string => typeof t === "string")
++        .join("");
++    assert.equal(text, "hello");
++    // The shell is preserved on every forwarded frame: the client reads `response`.
++    assert.ok(parsed.every((ev) => typeof ev["response"] === "object"));
++    assert.equal((((parsed.at(-1)!["response"] as Record<string, unknown>)["candidates"] as Array<Record<string, unknown>>)[0]!)["finishReason"], "STOP");
++});
++
++test("chat pipe (google, v1internal shell): a cut before any finishReason still reports the truncation", async () => {
++    const out: string[] = [];
++    await pipePluginChatWithStrip(
++        streamOf([textFrame("partial")]),
++        makeRes(out),
++        "google",
++    );
++    assert.equal(hasTruncation(out), true, "a shelled stream without finishReason must keep the truncation signal");
++});
++
++test("chat pipe (google, plain body): control — unchanged behaviour without a shell", async () => {
++    const out: string[] = [];
++    await pipePluginChatWithStrip(
++        streamOf([plain({ candidates: [{ index: 0, content: { role: "model", parts: [{ text: "hi" }] } }] }), plain({ candidates: [{ index: 0, finishReason: "STOP" }] })]),
++        makeRes(out),
++        "google",
++    );
++    assert.equal(hasTruncation(out), false);
++    assert.ok(frames(out).every((ev) => ev["response"] === undefined));
++});
+-- 
+2.54.0 (Apple Git-157)
+

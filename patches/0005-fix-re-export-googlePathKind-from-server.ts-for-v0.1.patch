@@ -1,0 +1,131 @@
+From 962b96bbe49ed5550a0957a03354fa7f82ce4167 Mon Sep 17 00:00:00 2001
+From: dingkaijian <dingkaijian@shizhuang-inc.com>
+Date: Thu, 22 Oct 2026 21:56:39 +0800
+Subject: [PATCH 5/5] fix: re-export googlePathKind from server.ts for v0.1.204
+
+Upstream v0.1.204 ships googlePathKind itself (server.ts local definition,
+merged from our fork commit). Our fork had moved it to util.ts, so the
+rebase's 3-way dropped the upstream export and broke handle.ts/relay.ts/
+vertex.test.ts imports from server.js. Restore the export as a util.ts
+re-export (identical implementation) instead of deleting the imports.
+Tests: adapt v1internal cases to stricter ParsedStreamEvent narrowing and
+unknown candidate access via a candidatesOf helper.
+---
+ src/server.ts                |  1 +
+ src/server/handle.ts         |  2 +-
+ src/server/relay.ts          |  2 +-
+ tests/adapter-google.test.ts | 27 +++++++++++++++++----------
+ 4 files changed, 20 insertions(+), 12 deletions(-)
+
+diff --git a/src/server.ts b/src/server.ts
+index bb5bef29..4cf0d53d 100644
+--- a/src/server.ts
++++ b/src/server.ts
+@@ -121,6 +121,7 @@ import { setupMitm, readMitmUpstream, getBlindTunnelStats, liveBlindTunnels, MIT
+ import { evaluateChain, extractChainCarriers, stripEmbeddedChainCarriers } from "./chain-checkpoint.js";
+ import type { BiliMessage } from "acp-kernel/wire";
+ import { appendSystemText, applyEstimateCalibration, currentCalibrationFactor, BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, googlePathKind, hardenOpenaiAssistantContent, isLoopbackAddress, normalizeUpstreamOrigin, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, systemToUser, strippedResponseIdWarning, type WireProtocol } from "./util.js";
++export { googlePathKind } from "./util.js";
+ 
+ import { BILI_TUNNEL_HEADER, checkTunnelDestination, classifyIp, localMachineIps, normalizeIpLiteral, parseIpLiteral, tunnelAllowlistFromEnv } from "./tunnel-guard.js";
+ 
+diff --git a/src/server/handle.ts b/src/server/handle.ts
+index fae9b8b8..20226641 100644
+--- a/src/server/handle.ts
++++ b/src/server/handle.ts
+@@ -43,7 +43,7 @@ import { resolveClaudeTranscriptLineage } from "../claude-transcript-lineage.js"
+ import { consumePluginRegisterFor, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginReportedModel, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, publicForkInputCheck, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "../plugin.js";
+ import { scheduleAffinityPersist } from "../affinity-persist.js";
+ import { evaluateChain, extractChainCarriers } from "../chain-checkpoint.js";
+-import { BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, googlePathKind, googleV1InternalPath, isLoopbackAddress, reserveOutputHeadroom, resolveOutputHeadroomCap, rewrapAntigravityEnvelope, shouldReserveOutputHeadroom, unwrapAntigravityEnvelope, type WireProtocol } from "../util.js";
++import { BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, googleV1InternalPath, isLoopbackAddress, reserveOutputHeadroom, resolveOutputHeadroomCap, rewrapAntigravityEnvelope, shouldReserveOutputHeadroom, unwrapAntigravityEnvelope, type WireProtocol } from "../util.js";
+ import { checkTunnelDestination, tunnelAllowlistFromEnv } from "../tunnel-guard.js";
+ import { resolveCompatDropFields } from "../compat-drop.js";
+ import { DecompressedTooLargeError, decodeRequestBody } from "../content-encoding.js";
+diff --git a/src/server/relay.ts b/src/server/relay.ts
+index 09b14a78..738132ca 100644
+--- a/src/server/relay.ts
++++ b/src/server/relay.ts
+@@ -54,7 +54,7 @@ import { safePrefix, safeSuffix, scrubLoneSurrogatesOnWire } from "../text-safe.
+ import { clearUpstreamAlertsForHost, recordUpstreamAlert, recordUpstreamCircuitFailure, recordUpstreamCircuitSuccess, upstreamCircuitBlockReason, upstreamCircuitLastFailureKind } from "../upstream-alerts.js";
+ import { describeUpstreamFailure, formatUpstreamError, proxyDispatcher, recordUpstreamConnection } from "../upstream-proxy.js";
+ import { withUpstreamFailure, type UpstreamFailureKind } from "../upstream-fail.js";
+-import { applyEstimateCalibration, currentCalibrationFactor, googlePathKind, inspectContextOverflow, MIN_ASSUMED_WINDOW_TOKENS, normalizeUpstreamOrigin, usageOutputTotal, usageTotals, type ContextOverflowInfo, type WireProtocol } from "../util.js";
++import { applyEstimateCalibration, currentCalibrationFactor, inspectContextOverflow, MIN_ASSUMED_WINDOW_TOKENS, normalizeUpstreamOrigin, usageOutputTotal, usageTotals, type ContextOverflowInfo, type WireProtocol } from "../util.js";
+ import { recordPckAblation } from "../pck-probe.js";
+ import { applyOutputSteering, applyOutputSteeringJson } from "../output-steering.js";
+ import { estimateWireOverhead } from "./budget.js";
+diff --git a/tests/adapter-google.test.ts b/tests/adapter-google.test.ts
+index a57a8514..bc4bacd4 100644
+--- a/tests/adapter-google.test.ts
++++ b/tests/adapter-google.test.ts
+@@ -404,6 +404,8 @@ const responseOf = (parsed: Record<string, unknown>): Record<string, unknown> =>
+     assert.ok(shell && typeof shell === "object", `frame carries the response shell: ${JSON.stringify(parsed).slice(0, 80)}`);
+     return shell;
+ };
++const candidatesOf = (shell: Record<string, unknown>): Array<Record<string, any>> =>
++    (shell.candidates as Array<Record<string, any>> | undefined) ?? [];
+ 
+ test("google parseStream v1internal: unwraps {response:...} frames, passthrough keeps the shell", async () => {
+     const events = await collect(
+@@ -416,13 +418,13 @@ test("google parseStream v1internal: unwraps {response:...} frames, passthrough
+     const text = events[0];
+     assert.ok(text.kind === "text" && text.delta === "Hello " && text.raw, "text delta with passthrough raw");
+     if (text.kind === "text" && text.raw) {
+-        const parts = responseOf(frameJson(text.raw)).candidates[0].content.parts;
++        const parts = candidatesOf(responseOf(frameJson(text.raw)))[0].content.parts;
+         assert.equal(parts[0].text, "Hello ", "passthrough frame keeps the upstream shell");
+     }
+     const reason = events[1];
+     assert.ok(reason.kind === "reasoning" && reason.delta === "weighing" && reason.raw, "reasoning delta with passthrough raw");
+     if (reason.kind === "reasoning" && reason.raw) {
+-        const parts = responseOf(frameJson(reason.raw)).candidates[0].content.parts;
++        const parts = candidatesOf(responseOf(frameJson(reason.raw)))[0].content.parts;
+         assert.equal(parts[0].text, "weighing");
+         assert.equal(parts[0].thought, true, "reasoning part survives the shell round-trip");
+     }
+@@ -450,9 +452,9 @@ test("google parseStream v1internal: an edited text frame is rebuilt and re-shel
+     assert.ok(text.kind === "text" && text.delta === "final " && text.raw, "edited delta with rebuilt raw");
+     if (text.kind === "text" && text.raw) {
+         const shell = responseOf(frameJson(text.raw));
+-        const parts = shell.candidates[0].content.parts;
++        const parts = candidatesOf(shell)[0].content.parts;
+         assert.equal(parts[0].text, "final ", "rebuilt frame carries the clean bytes");
+-        assert.equal(shell.candidates[0].finishReason, undefined, "dropped finishReason stays dropped inside the shell");
++        assert.equal(candidatesOf(shell)[0].finishReason, undefined, "dropped finishReason stays dropped inside the shell");
+     }
+ });
+ 
+@@ -472,10 +474,10 @@ test("google parseStream v1internal: settle replay keeps the shelled call frame"
+         assert.equal(call.passthrough, true, "real call is raw-replayed for the client");
+     }
+     const replay = events.find((e) => e.kind === "meta");
+-    assert.ok(replay?.chunk, "settle replay has a chunk");
+-    if (replay?.chunk) {
++    assert.ok(replay && replay.kind === "meta", "settle replay has a chunk");
++    if (replay && replay.kind === "meta" && replay.chunk) {
+         // settle "keep" replay: original upstream bytes, shell intact
+-        const parts = responseOf(frameJson(replay.chunk)).candidates[0].content.parts;
++        const parts = candidatesOf(responseOf(frameJson(replay.chunk)))[0].content.parts;
+         assert.equal(parts[0].functionCall.name, "get_weather", "settle replay keeps the shelled call frame");
+     }
+ });
+@@ -486,7 +488,12 @@ test("google parseStream v1internal: a top-level error frame passes through un-s
+         sse({ error: { code: 500, message: "boom", status: "INTERNAL" } }),
+     );
+     assert.deepEqual(events.map((e) => e.kind), ["meta"], "error frame is handed through as a passthrough meta chunk");
+-    const parsed = frameJson(events[0].chunk);
+-    assert.equal(parsed.error?.status, "INTERNAL", "error payload intact");
+-    assert.equal("response" in parsed, false, "no shell added to an error frame");
++    const first = events[0];
++    assert.ok(first && first.kind === "meta" && first.chunk, "meta chunk present");
++    if (first && first.kind === "meta" && first.chunk) {
++        const parsed = frameJson(first.chunk);
++        const err = parsed.error as Record<string, unknown> | undefined;
++        assert.equal(err?.status, "INTERNAL", "error payload intact");
++        assert.equal("response" in parsed, false, "no shell added to an error frame");
++    }
+ });
+-- 
+2.54.0 (Apple Git-157)
+

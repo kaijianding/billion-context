@@ -1,0 +1,154 @@
+From 3fac6c02f6cf9ed6f7d5abf336c166bb9efbc9d3 Mon Sep 17 00:00:00 2001
+From: dingkaijian <dingkaijian@shizhuang-inc.com>
+Date: Fri, 9 Oct 2026 22:53:25 +0800
+Subject: [PATCH 1/5] fix(agent): recognize google streamGenerateContent in
+ native fetch intercept
+
+Add shared googlePathKind() classifier in util.ts so server.ts,
+server/handle.ts, server/relay.ts and agent/native-intercept.ts keep one
+definition. native-intercept.isModelApiUrl returns true for google
+generate/count-tokens paths, routing antigravity/gemini streamGenerateContent
+through the bili proxy (was wire-mode direct, leaving ~492k raw cacheRead
+per turn).
+---
+ src/agent/native-intercept.ts  |  3 ++-
+ src/server.ts                  | 13 +++----------
+ src/server/handle.ts           |  2 +-
+ src/server/relay.ts            |  4 ++--
+ src/util.ts                    | 18 ++++++++++++++++++
+ tests/native-intercept.test.ts |  3 +++
+ 6 files changed, 29 insertions(+), 14 deletions(-)
+
+diff --git a/src/agent/native-intercept.ts b/src/agent/native-intercept.ts
+index bd290508..99398055 100644
+--- a/src/agent/native-intercept.ts
++++ b/src/agent/native-intercept.ts
+@@ -11,7 +11,7 @@ import { logHostEvent } from "./host-log.js";
+ 
+ import { envMillis } from "./native-bootstrap.js";
+ import { probeLiveness, type LivenessVerdict } from "../liveness.js";
+-import { BILI_PASSTHROUGH_HEADER } from "../util.js";
++import { BILI_PASSTHROUGH_HEADER, googlePathKind } from "../util.js";
+ import { DSH_COMPACTION_MARKER_SNIFF } from "../server/dsh-compaction-guard.js";
+ import { APIG_RESIGN_HEADER, APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_SCHEME, clearSignedRefusal, encodeApigCredential, inboundSignedScheme, recordSignedRefusal, resignEnabled, resignPassthroughEnabled, signedRefusal } from "../apig-resign.js";
+ 
+@@ -244,6 +244,7 @@ export function isModelApiUrl(url: string): boolean {
+         const segments = u.pathname.split("/").filter((s) => s.length > 0);
+         if (segments[0] === "bili") return false;
+         const pathname = u.pathname.replace(/\/+$/, "");
++        if (googlePathKind(pathname) !== null) return true;
+         return MODEL_API_SUFFIX.test(pathname);
+     } catch {
+         return false;
+diff --git a/src/server.ts b/src/server.ts
+index 2699a7f7..5cc98d99 100644
+--- a/src/server.ts
++++ b/src/server.ts
+@@ -120,7 +120,7 @@ import { consumePluginRegisterFor, flushConversations, handlePluginCompact, hand
+ import { setupMitm, readMitmUpstream, getBlindTunnelStats, liveBlindTunnels, MITM_RAW_SOCKET_KEY } from "./mitm.js";
+ import { evaluateChain, extractChainCarriers, stripEmbeddedChainCarriers } from "./chain-checkpoint.js";
+ import type { BiliMessage } from "acp-kernel/wire";
+-import { appendSystemText, applyEstimateCalibration, currentCalibrationFactor, BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, hardenOpenaiAssistantContent, isLoopbackAddress, normalizeUpstreamOrigin, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, systemToUser, strippedResponseIdWarning, type WireProtocol } from "./util.js";
++import { appendSystemText, applyEstimateCalibration, currentCalibrationFactor, BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, googlePathKind, hardenOpenaiAssistantContent, isLoopbackAddress, normalizeUpstreamOrigin, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, systemToUser, strippedResponseIdWarning, type WireProtocol } from "./util.js";
+ 
+ import { BILI_TUNNEL_HEADER, checkTunnelDestination, classifyIp, localMachineIps, normalizeIpLiteral, parseIpLiteral, tunnelAllowlistFromEnv } from "./tunnel-guard.js";
+ 
+@@ -394,15 +394,8 @@ function armRequestWatchdog(req: http.IncomingMessage, res: http.ServerResponse,
+  *  in the path, never in the body: `/v1beta/models/<model>:streamGenerateContent`
+  *  (streaming, usually with `alt=sse`), `:generateContent` (single shot) and
+  *  `:countTokens`. Returns null for every other path (model listing, files,
+- *  cachedContents, the OpenAI-compatible `/v1beta/openai/...` mirror). */
+-type GooglePathKind = "stream-generate" | "generate" | "count-tokens";
+-
+-export function googlePathKind(urlPath: string): GooglePathKind | null {
+-    if (urlPath.includes(":streamGenerateContent")) return "stream-generate";
+-    if (urlPath.includes(":generateContent")) return "generate";
+-    if (urlPath.includes(":countTokens")) return "count-tokens";
+-    return null;
+-}
++ *  cachedContents, the OpenAI-compatible `/v1beta/openai/...` mirror).
++ *  Moved to util.ts — see googlePathKind there (shared with native-intercept.ts). */
+ 
+ /** The Gemini request carries the model in the URL path, never in the body
+  *  (`POST /v1beta/models/gemini-3.8-flash:streamGenerateContent`). Every
+diff --git a/src/server/handle.ts b/src/server/handle.ts
+index 7f19954f..a84a0038 100644
+--- a/src/server/handle.ts
++++ b/src/server/handle.ts
+@@ -43,7 +43,7 @@ import { resolveClaudeTranscriptLineage } from "../claude-transcript-lineage.js"
+ import { consumePluginRegisterFor, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginReportedModel, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, publicForkInputCheck, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "../plugin.js";
+ import { scheduleAffinityPersist } from "../affinity-persist.js";
+ import { evaluateChain, extractChainCarriers } from "../chain-checkpoint.js";
+-import { BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, isLoopbackAddress, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, type WireProtocol } from "../util.js";
++import { BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, googlePathKind, isLoopbackAddress, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, type WireProtocol } from "../util.js";
+ import { checkTunnelDestination, tunnelAllowlistFromEnv } from "../tunnel-guard.js";
+ import { resolveCompatDropFields } from "../compat-drop.js";
+ import { DecompressedTooLargeError, decodeRequestBody } from "../content-encoding.js";
+diff --git a/src/server/relay.ts b/src/server/relay.ts
+index 594cd987..09b14a78 100644
+--- a/src/server/relay.ts
++++ b/src/server/relay.ts
+@@ -54,7 +54,7 @@ import { safePrefix, safeSuffix, scrubLoneSurrogatesOnWire } from "../text-safe.
+ import { clearUpstreamAlertsForHost, recordUpstreamAlert, recordUpstreamCircuitFailure, recordUpstreamCircuitSuccess, upstreamCircuitBlockReason, upstreamCircuitLastFailureKind } from "../upstream-alerts.js";
+ import { describeUpstreamFailure, formatUpstreamError, proxyDispatcher, recordUpstreamConnection } from "../upstream-proxy.js";
+ import { withUpstreamFailure, type UpstreamFailureKind } from "../upstream-fail.js";
+-import { applyEstimateCalibration, currentCalibrationFactor, inspectContextOverflow, MIN_ASSUMED_WINDOW_TOKENS, normalizeUpstreamOrigin, usageOutputTotal, usageTotals, type ContextOverflowInfo, type WireProtocol } from "../util.js";
++import { applyEstimateCalibration, currentCalibrationFactor, googlePathKind, inspectContextOverflow, MIN_ASSUMED_WINDOW_TOKENS, normalizeUpstreamOrigin, usageOutputTotal, usageTotals, type ContextOverflowInfo, type WireProtocol } from "../util.js";
+ import { recordPckAblation } from "../pck-probe.js";
+ import { applyOutputSteering, applyOutputSteeringJson } from "../output-steering.js";
+ import { estimateWireOverhead } from "./budget.js";
+@@ -62,7 +62,7 @@ import { buildForwardHeaders, connectionNamedHeaders, RESPONSE_ONLY_STRIP_HEADER
+ import { bodyDumpEnabled, logDumpFailure } from "./observability.js";
+ import { effectiveAbsorbBlock } from "./prepare-responses.js";
+ import { awaitDrain, bufferToStream, dumpStreamToFile, pipeThrough, readStreamToBuffer } from "./stream-io.js";
+-import { buildForwardTarget, outboundPayloadBreakdown, registerRequestAbort, beginStreamKeepalive, effectiveTokenCount, googlePathKind, imageBillingFor, imageTokenCapFor, inboundResignCredential, outboundContextEstimates, repairResponsesAssistantOrdering, resolveUpstream, stripKernelSummaries, usageGradeInputBaseline, DOOMED_PROBE_ABSOLUTE_BYTES, DOOMED_PROBE_BYTES_PER_TOKEN, type Prepared } from "../server.js";
++import { buildForwardTarget, outboundPayloadBreakdown, registerRequestAbort, beginStreamKeepalive, effectiveTokenCount, googlePathKind, imageBillingFor, imageTokenCapFor, inboundResignCredential, outboundContextEstimates, repairResponsesAssistantOrdering, resignSettingsFor, resolveUpstream, stripKernelSummaries, usageGradeInputBaseline, DOOMED_PROBE_ABSOLUTE_BYTES, DOOMED_PROBE_BYTES_PER_TOKEN, type Prepared } from "../server.js";
+ 
+ /** Infer the wire protocol from the request path for compat-role rewrites on
+  *  requests the pipeline did not prepare (passthrough). Mirrors the path
+diff --git a/src/util.ts b/src/util.ts
+index c7f2c277..046da22f 100644
+--- a/src/util.ts
++++ b/src/util.ts
+@@ -130,6 +130,24 @@ export function currentCalibrationFactor(stats: { calibratedEstimate?: number; c
+ 
+ export type WireProtocol = "anthropic" | "openai" | "responses" | "google";
+ 
++/**
++ * Classify a Gemini native request path. The model and the method both live
++ *  in the path, never in the body: `/v1beta/models/<model>:streamGenerateContent`
++ *  (streaming, usually with `alt=sse`), `:generateContent` (single shot) and
++ *  `:countTokens`. Returns null for every other path (model listing, files,
++ *  cachedContents, the OpenAI-compatible `/v1beta/openai/...` mirror).
++ *  Shared by the proxy (server.ts) and the native fetch patch
++ *  (agent/native-intercept.ts) — keep one definition so the wire-classification
++ *  and the URL-shape gate cannot drift apart. */
++export type GooglePathKind = "stream-generate" | "generate" | "count-tokens";
++
++export function googlePathKind(urlPath: string): GooglePathKind | null {
++    if (urlPath.includes(":streamGenerateContent")) return "stream-generate";
++    if (urlPath.includes(":generateContent")) return "generate";
++    if (urlPath.includes(":countTokens")) return "count-tokens";
++    return null;
++}
++
+ /**
+  * Compute the true TOTAL input-token count and the cached subset from a
+  * protocol-native `usage` object.
+diff --git a/tests/native-intercept.test.ts b/tests/native-intercept.test.ts
+index 2f9548fe..b5868f66 100644
+--- a/tests/native-intercept.test.ts
++++ b/tests/native-intercept.test.ts
+@@ -15,6 +15,9 @@ test("isModelApiUrl: matches model-API endpoint shapes", () => {
+     assert.equal(isModelApiUrl("https://open.bigmodel.cn/api/coding/paas/v4/chat/completions"), true);
+     assert.equal(isModelApiUrl("https://api.anthropic.com/v1/messages?beta=true"), true);
+     assert.equal(isModelApiUrl("http://localhost:9123/v1/messages/"), true);
++    assert.equal(isModelApiUrl("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:streamGenerateContent?alt=sse"), true);
++    assert.equal(isModelApiUrl("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"), true);
++    assert.equal(isModelApiUrl("https://aiplatform.googleapis.com/v1/models/gemini-pro:countTokens"), true);
+ });
+ 
+ test("isModelApiUrl: matches Google native wire shapes (#2493)", () => {
+-- 
+2.54.0 (Apple Git-157)
+
