@@ -245,16 +245,26 @@ export function createGoogleAdapter(
     absorbName?: string,
     model?: string,
     notes?: string[],
+    v1internal = false,
 ): CompressLoopAdapter {
     // Gemini carries the model in the URL path, not the body, so the server
     // hands it in; the body lookup only covers hand-built requests.
     const modelVersion = model ?? (typeof requestBody.model === "string" ? requestBody.model : undefined);
 
+    // omp's antigravity wire (`/v1internal:streamGenerateContent`) wraps every
+    // upstream chunk as `{"response":{...}}`; the client only reads
+    // `Ie.response.candidates/finishReason/usageMetadata`. Every rebuilt frame
+    // must keep that shell, while upstream frames are passed through verbatim
+    // (they already carry it) and error frames stay top-level.
+    const wrapObj = (obj: Record<string, unknown>): Record<string, unknown> =>
+        v1internal ? { response: obj } : obj;
+    const wrapFrame = (obj: Record<string, unknown>): Buffer => sseFrame(wrapObj(obj));
+
     const buildChunk = (
         parts: GooglePart[],
         extra: { candidate?: Record<string, unknown>; top?: Record<string, unknown> } = {},
     ): Buffer =>
-        sseFrame({
+        wrapFrame({
             ...(modelVersion ? { modelVersion } : {}),
             candidates: [{ content: { role: "model", parts }, index: 0, ...(extra.candidate ?? {}) }],
             ...(extra.top ?? {}),
@@ -454,7 +464,7 @@ export function createGoogleAdapter(
                     if (filtered === "keep") {
                         yield { kind: "meta", chunk: Buffer.from(`data: ${json}\n\n`, "utf8") } as ParsedStreamEvent;
                     } else if (filtered !== null) {
-                        yield { kind: "meta", chunk: sseFrame(filtered) } as ParsedStreamEvent;
+                        yield { kind: "meta", chunk: wrapFrame(filtered) } as ParsedStreamEvent;
                     } else {
                         // #1881: proxy-only chunk — its frame is dropped, but
                         // its withheld prose still has to reach the client.
@@ -489,6 +499,17 @@ export function createGoogleAdapter(
                     parsed = JSON.parse(json) as Record<string, unknown>;
                 } catch {
                     continue;
+                }
+                // omp's v1internal wire nests the standard chunk fields under
+                // `response`; unwrap so the logic below sees plain candidates/
+                // promptFeedback/usageMetadata. Frames without a `response`
+                // object (e.g. an error frame) stay untouched and fall through
+                // to the passthrough branches as-is.
+                if (v1internal) {
+                    const inner = parsed.response;
+                    if (inner !== null && typeof inner === "object" && !Array.isArray(inner)) {
+                        parsed = inner as Record<string, unknown>;
+                    }
                 }
                 const rawBuf = Buffer.from(`${frame}\n\n`, "utf8");
                 const candidates = parsed.candidates as Array<Record<string, unknown>> | undefined;
@@ -561,7 +582,7 @@ export function createGoogleAdapter(
                         let raw: Buffer | undefined;
                         // A chunk that also carries functionCall parts is replayed
                         // whole at settle, so its text must not be forwarded twice.
-                        if (!hasCallPart) raw = finishReason ? sseFrame(cloneChunk(parsed, { dropFinishReason: true })) : rawBuf;
+                        if (!hasCallPart) raw = finishReason ? wrapFrame(cloneChunk(parsed, { dropFinishReason: true })) : rawBuf;
                         yield {
                             kind: "reasoning",
                             delta: part.text,
@@ -579,11 +600,11 @@ export function createGoogleAdapter(
                     if (clean === part.text) {
                         // A chunk that also carries functionCall parts is replayed
                         // whole at settle, so its text must not be forwarded twice.
-                        if (!hasCallPart) raw = finishReason ? sseFrame(cloneChunk(parsed, { dropFinishReason: true })) : rawBuf;
+                        if (!hasCallPart) raw = finishReason ? wrapFrame(cloneChunk(parsed, { dropFinishReason: true })) : rawBuf;
                     } else {
                         editedParts = (editedParts ?? [...parts]).map((p, j) => (j === i ? { ...p, text: clean } : p));
                         if (!hasCallPart) {
-                            raw = sseFrame(cloneChunk(parsed, {
+                            raw = wrapFrame(cloneChunk(parsed, {
                                 parts: parts
                                     .map((p, j) => (j === i ? { ...p, text: clean } : p))
                                     .filter((p) => !p || typeof p !== "object" || p.functionCall === undefined),
@@ -595,7 +616,11 @@ export function createGoogleAdapter(
                 }
                 if (callIndexes.length > 0) {
                     const storedParsed = editedParts ? cloneChunk(parsed, { parts: editedParts }) : parsed;
-                    rawCallChunks.push({ json: editedParts ? JSON.stringify(storedParsed) : json, parsed: storedParsed, callIndexes });
+                    // The edited replay is rebuilt from the unwrapped inner
+                    // chunk, so it must be re-shelled for v1internal; the
+                    // unedited path keeps the upstream frame's own `json`
+                    // (which already carries the shell) byte-identical.
+                    rawCallChunks.push({ json: editedParts ? JSON.stringify(wrapObj(storedParsed)) : json, parsed: storedParsed, callIndexes });
                 }
                 // #3158: standalone thoughtSignature parts modeled no event above
                 // and vanished from the client's stream. When nothing else in the
@@ -651,7 +676,7 @@ export function createGoogleAdapter(
                         // so the stub carries NO parts — resending them duplicates
                         // the prose on the wire.
                         const finishHasCall = parts.some((p) => p && typeof p === "object" && p.functionCall !== undefined);
-                        const finishChunk = finishHasCall ? sseFrame(cloneChunk(parsed, { parts: [] })) : rawBuf;
+                        const finishChunk = finishHasCall ? wrapFrame(cloneChunk(parsed, { parts: [] })) : rawBuf;
                         yield { kind: "meta", chunk: finishChunk } as ParsedStreamEvent;
                         yield { kind: "done", finishReason, suppressCompletion: true, ...(truncated ? { truncated: true } : {}) } as ParsedStreamEvent;
                     } else {

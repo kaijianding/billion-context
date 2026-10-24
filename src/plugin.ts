@@ -68,7 +68,7 @@ import { describeUpdateReady, getUpdateVisibility } from "./update-notes.js";
 import { warnCacheCollapse } from "./cache-warn.js";
 import { currentContextObservation, recordContextObservation, settleUsageReport } from "./cache-ledger.js";
 import { billOutputUsage } from "./billing.js";
-import { promptInputTotal, declaredInclusiveFromUsage, type WireProtocol } from "./util.js";
+import { antigravityFrameView, declaredInclusiveFromUsage, promptInputTotal, rewrapAntigravityFrame, type WireProtocol } from "./util.js";
 import { stateDir } from "./paths.js";
 import { lookupToolUseIdSession, lookupToolWitness, recordToolUseId, recordToolWitness } from "./tool-ring.js";
 import { awaitDrain } from "./server/stream-io.js";
@@ -2322,7 +2322,8 @@ function num(v: unknown): number | undefined {
  *  context (the `cachedContentTokenCount` prefix included) and thinking tokens
  *  are billed ON TOP of the candidate's, so both count as output. */
 function googleUsageSample(obj: Record<string, unknown>): UsageSample | undefined {
-    const meta = obj["usageMetadata"];
+    // v1internal frames carry the Gemini payload under `response`.
+    const meta = antigravityFrameView(obj).view["usageMetadata"];
     if (!meta || typeof meta !== "object") return undefined;
     const u = meta as Record<string, unknown>;
     const cand = num(u["candidatesTokenCount"]);
@@ -3314,12 +3315,15 @@ export async function pipePluginChatWithStrip(
      *  choices/content blocks — one filter keyed per (candidate index, field) —
      *  and a `finishReason` chunk is this wire's terminal event. */
     const processGoogle = (ev: Record<string, unknown>, rawEvent: string): string => {
-        if (typeof ev["modelVersion"] === "string") lastChunkMeta = { ...lastChunkMeta, modelVersion: ev["modelVersion"] };
+        // Antigravity nests the Gemini payload under `response`; inspect the
+        // inner object and re-wrap every rebuild into the same shell.
+        const { view: gv, shell: gShell } = antigravityFrameView(ev);
+        if (typeof gv["modelVersion"] === "string") lastChunkMeta = { ...lastChunkMeta, modelVersion: gv["modelVersion"] };
         // A top-level `error` object is Gemini's other terminal shape (HTTP-level
         // failures arrive mid-stream too): the client throws on it, so the turn
         // is over and must not also be reported as an upstream truncation.
-        if (ev["error"] !== undefined) sawTerminal = true;
-        const candidates = ev["candidates"];
+        if (gv["error"] !== undefined) sawTerminal = true;
+        const candidates = gv["candidates"];
         if (!Array.isArray(candidates)) {
             // #2248: raw exit — non-candidates frames never enter the filter.
             auditRawForward(rawEvent);
@@ -3444,7 +3448,7 @@ export async function pipePluginChatWithStrip(
                     // parsed event (callers keep `ev` for logs/usage).
                     if (!rebuilt) {
                         rebuilt = {
-                            ...ev,
+                            ...gv,
                             candidates: candidates.map((c) => {
                                 if (!c || typeof c !== "object") return c;
                                 const cand = { ...(c as Record<string, unknown>) };
@@ -3472,12 +3476,12 @@ export async function pipePluginChatWithStrip(
             // finishReason / functionCall / usageMetadata sibling must survive,
             // the chat processor's #463 rule).
             if (droppedText && !keptText && !googleFrameHasNonText(rebuilt)) return "";
-            return drain + rebuildEvent(rawEvent, rebuilt);
+            return drain + rebuildEvent(rawEvent, rewrapAntigravityFrame(gShell, rebuilt));
         }
         // #2248: raw exit — text outside managed parts never enters the filter.
         // Frames carrying non-text parts (functionCall/functionResponse, ...) hold
         // structured or user data (#1039) and are excluded from the audit.
-        if (!googleFrameHasNonText(ev)) auditRawForward(rawEvent);
+        if (!googleFrameHasNonText(gv)) auditRawForward(rawEvent);
         if (drain.length > 0) return drain + rawEvent + "\n\n";
         if (!hadText && anyPending()) return flushTails() + rawEvent + "\n\n";
         return rawEvent + "\n\n";
@@ -3531,6 +3535,10 @@ export async function pipePluginChatWithStrip(
                         continue;
                     }
                     diagEvents++;
+                    // Antigravity (v1internal) frames nest the Gemini payload
+                    // under `response`: every reader below must inspect that
+                    // view or it sees no candidates/usage at all (#v1internal).
+                    const googleView = protocol === "google" ? antigravityFrameView(ev).view : undefined;
                     // #2328: wire-native label where one exists; the chat wires
                     // without a `type` get a synthesized one so the last-events
                     // trail is readable in the diag.
@@ -3540,7 +3548,8 @@ export async function pipePluginChatWithStrip(
                         const fr = c0 && typeof c0 === "object" ? (c0 as Record<string, unknown>)["finish_reason"] : undefined;
                         diagPushType(typeof fr === "string" ? `chunk:finish=${fr}` : "chunk");
                     } else if (protocol === "google") {
-                        const c0 = Array.isArray(ev["candidates"]) ? (ev["candidates"] as unknown[])[0] : undefined;
+                        const gc = googleView ? googleView["candidates"] : undefined;
+                        const c0 = Array.isArray(gc) ? (gc as unknown[])[0] : undefined;
                         const fr = c0 && typeof c0 === "object" ? (c0 as Record<string, unknown>)["finishReason"] : undefined;
                         diagPushType(typeof fr === "string" ? `chunk:finish=${fr}` : "chunk");
                     } else diagPushType("frame");
@@ -3578,7 +3587,7 @@ export async function pipePluginChatWithStrip(
                         // #732/#821 machinery reaches this wire. finalFinishReason
                         // keeps the raw value for diag/warn (processGoogle sets it
                         // to the same value below).
-                        const candidates = ev["candidates"];
+                        const candidates = googleView ? googleView["candidates"] : undefined;
                         if (Array.isArray(candidates)) {
                             for (const c of candidates) {
                                 const fr = c && typeof c === "object" ? (c as Record<string, unknown>)["finishReason"] : undefined;

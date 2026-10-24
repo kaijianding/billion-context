@@ -149,6 +149,19 @@ export function googlePathKind(urlPath: string): GooglePathKind | null {
 }
 
 /**
+ * omp's antigravity wire calls the model API through `/v1internal:streamGenerateContent`
+ * (no `/models/<model>:` segment) and wraps every SSE chunk as
+ * `{"response":{...}}`; the loop adapter needs to know which chunk shape it
+ * will see. Shared by server.ts (prepare dispatch) and agent/native-intercept.ts
+ * (URL-shape gate) — keep one definition so the two cannot drift apart.
+ * Note: `googlePathKind` still classifies this path as "stream-generate", so
+ * protocol detection needs no change; this flag only selects the chunk shape.
+ */
+export function googleV1InternalPath(urlPath: string): boolean {
+    return urlPath.split("?")[0].includes("/v1internal:");
+}
+
+/**
  * Compute the true TOTAL input-token count and the cached subset from a
  * protocol-native `usage` object.
  *
@@ -833,6 +846,24 @@ export function unwrapAntigravityEnvelope(parsed: unknown): { inner: unknown; sh
     if (req === null || typeof req !== "object" || Array.isArray(req)) return { inner: parsed, shell: undefined };
     if (!Array.isArray((req as Record<string, unknown>).contents)) return { inner: parsed, shell: undefined };
     return { inner: req, shell: top };
+}
+
+/**
+ * The RESPONSE side of the same envelope: antigravity's v1internal stream
+ * frames every Gemini chunk as `{"response":{candidates,...}}` (the shell also
+ * carries `traceId`/`metadata`). Readers that inspect a frame — usage, finish
+ * reason, tag-echo filtering — must look at the inner object; a frame without
+ * the shell is returned as its own view so plain Gemini bodies keep working.
+ */
+export function antigravityFrameView(frame: Record<string, unknown>): { view: Record<string, unknown>; shell: Record<string, unknown> | undefined } {
+    const resp = frame.response;
+    if (resp === null || typeof resp !== "object" || Array.isArray(resp)) return { view: frame, shell: undefined };
+    return { view: resp as Record<string, unknown>, shell: frame };
+}
+
+/** Re-wrap a rebuilt stream frame so it keeps the antigravity shell shape. */
+export function rewrapAntigravityFrame(shell: Record<string, unknown> | undefined, rebuilt: Record<string, unknown>): Record<string, unknown> {
+    return shell ? { ...shell, response: rebuilt } : rebuilt;
 }
 
 /** Re-wrap a rebuilt GoogleRequestBody into the omp antigravity envelope. */

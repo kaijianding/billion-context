@@ -28,7 +28,7 @@ export function pickAdapter(
     anthropicSystem?: AnthropicRequestBody["system"],
     openaiSystem?: string,
     absorbName?: string,
-    google?: { system?: string; model?: string },
+    google?: { system?: string; model?: string; v1internal?: boolean },
     systemNotes?: string[],
     streamErrorShape?: "protocol" | "completion",
     anthropicCacheMarks?: Map<string, { type: "ephemeral" }>,
@@ -41,6 +41,6 @@ export function pickAdapter(
     if (protocol === "responses") return createResponsesAdapter(textProtocol, responsesProjection, absorbName, systemNotes);
     if (protocol === "openai") return createOpenaiAdapter(requestBody, openaiSystem, absorbName, systemNotes, shape);
     if (protocol === "anthropic") return createAnthropicAdapter(requestBody, anthropicSystem, systemNotes, shape, anthropicCacheMarks, anthropicClientCacheControls, absorbArmed);
-    if (protocol === "google") return createGoogleAdapter(requestBody, google?.system, absorbName, google?.model, systemNotes);
+    if (protocol === "google") return createGoogleAdapter(requestBody, google?.system, absorbName, google?.model, systemNotes, google?.v1internal);
     throw new Error(`[acp-loop] unknown protocol: ${protocol}`);
 }

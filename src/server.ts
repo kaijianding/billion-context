@@ -1959,7 +1959,7 @@ export type Prepared = {
      *  it out of the fold space) and the path-derived model. Both are needed to
      *  rebuild `systemInstruction` and to synthesize chunks on every compress
      *  loop round. */
-    google?: { system?: string; model?: string };
+    google?: { system?: string; model?: string; v1internal?: boolean };
     /** #1085: stable-system-anchor update notes for this turn — re-injected
      *  as trailing user messages so compress-loop rounds see the same
      *  updated-instructions context the main request did. */

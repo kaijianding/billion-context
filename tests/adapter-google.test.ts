@@ -349,3 +349,103 @@ test("google parseStream: a null sibling part does not break the edited frame", 
     const frames = framesOf(events);
     assert.ok(frames.some((f) => f.includes("kept prose")), `the prose still reaches the client, got: ${frames.join(" | ")}`);
 });
+
+// ---- omp antigravity wire: /v1internal:streamGenerateContent --------------
+// The client nests every chunk under `{"response":{...}}` and only reads
+// `Ie.response.candidates/finishReason/usageMetadata`. The adapter unwraps
+// upstream frames internally and must re-shell every chunk it rebuilds;
+// frames that pass through verbatim keep their original (already-shelled)
+// bytes, and error frames stay top-level.
+
+const V1 = (inner: Record<string, unknown>): Record<string, unknown> => ({ response: inner });
+const responseOf = (parsed: Record<string, unknown>): Record<string, unknown> => {
+    const shell = parsed.response as Record<string, unknown> | undefined;
+    assert.ok(shell && typeof shell === "object", `frame carries the response shell: ${JSON.stringify(parsed).slice(0, 80)}`);
+    return shell;
+};
+
+test("google parseStream v1internal: unwraps {response:...} frames, passthrough keeps the shell", async () => {
+    const events = await collect(
+        createGoogleAdapter({}, undefined, undefined, "gemini-3-pro-preview", undefined, true),
+        sse(V1({ candidates: [{ content: { role: "model", parts: [{ text: "Hello " }] }, index: 0 }] })) +
+            sse(V1({ candidates: [{ content: { role: "model", parts: [{ thought: true, text: "weighing", thoughtSignature: "sig-1" }] }, index: 0 }] })) +
+            sse(V1({ candidates: [{ content: { role: "model", parts: [] }, finishReason: "STOP", index: 0 }], usageMetadata: { promptTokenCount: 11, candidatesTokenCount: 2 } })),
+    );
+    assert.deepEqual(events.map((e) => e.kind), ["text", "reasoning", "usage", "done"], "chunk shape does not disturb event order");
+    const text = events[0];
+    assert.ok(text.kind === "text" && text.delta === "Hello " && text.raw, "text delta with passthrough raw");
+    if (text.kind === "text" && text.raw) {
+        const parts = responseOf(frameJson(text.raw)).candidates[0].content.parts;
+        assert.equal(parts[0].text, "Hello ", "passthrough frame keeps the upstream shell");
+    }
+    const reason = events[1];
+    assert.ok(reason.kind === "reasoning" && reason.delta === "weighing" && reason.raw, "reasoning delta with passthrough raw");
+    if (reason.kind === "reasoning" && reason.raw) {
+        const parts = responseOf(frameJson(reason.raw)).candidates[0].content.parts;
+        assert.equal(parts[0].text, "weighing");
+        assert.equal(parts[0].thought, true, "reasoning part survives the shell round-trip");
+    }
+    const usage = events[2];
+    assert.ok(usage.kind === "usage", "usage event");
+    if (usage.kind === "usage") {
+        assert.equal(usage.inputTokens, 11);
+        assert.equal(usage.outputTokens, 2);
+    }
+    const done = events[3];
+    assert.ok(done.kind === "done" && done.finishReason === "STOP", "done terminates the stream");
+});
+
+test("google parseStream v1internal: an edited text frame is rebuilt and re-shelled", async () => {
+    // The tag-filtered copy is rebuilt by the adapter (parts replaced,
+    // finishReason dropped) — it must come out wrapped in `response` again.
+    const TAG = "\x3cacp tokens=\"1\" type=\"text\"\x3e";
+    const CLOSE = "\x3c/acp\x3e";
+    const events = await collect(
+        createGoogleAdapter({}, undefined, undefined, "gemini-3-pro-preview", undefined, true),
+        sse(V1({ candidates: [{ content: { role: "model", parts: [{ text: `${TAG}m00001${CLOSE}final ` }] }, index: 0 }] })),
+    );
+    assert.deepEqual(events.map((e) => e.kind), ["text"], "edited text is forwarded as a text event");
+    const text = events[0];
+    assert.ok(text.kind === "text" && text.delta === "final " && text.raw, "edited delta with rebuilt raw");
+    if (text.kind === "text" && text.raw) {
+        const shell = responseOf(frameJson(text.raw));
+        const parts = shell.candidates[0].content.parts;
+        assert.equal(parts[0].text, "final ", "rebuilt frame carries the clean bytes");
+        assert.equal(shell.candidates[0].finishReason, undefined, "dropped finishReason stays dropped inside the shell");
+    }
+});
+
+test("google parseStream v1internal: settle replay keeps the shelled call frame", async () => {
+    const events = await collect(
+        createGoogleAdapter({}, undefined, undefined, "gemini-3-pro-preview", undefined, true),
+        sse(V1({ candidates: [{ content: { role: "model", parts: [{ functionCall: { name: "get_weather", args: { city: "x" }, id: "call_2" } }] }, index: 0 }] })) +
+            sse(V1({ candidates: [{ content: { role: "model", parts: [] }, finishReason: "STOP", index: 0 }] })),
+    );
+    const kinds = events.map((e) => e.kind);
+    assert.ok(kinds.includes("tool_call") && kinds.includes("meta") && kinds.includes("done"), `kinds: ${kinds.join(",")}`);
+    const call = events.find((e) => e.kind === "tool_call");
+    assert.ok(call && call.kind === "tool_call", "real call surfaced");
+    if (call && call.kind === "tool_call") {
+        assert.equal(call.name, "get_weather");
+        assert.equal(call.callId, "call_2");
+        assert.equal(call.passthrough, true, "real call is raw-replayed for the client");
+    }
+    const replay = events.find((e) => e.kind === "meta");
+    assert.ok(replay?.chunk, "settle replay has a chunk");
+    if (replay?.chunk) {
+        // settle "keep" replay: original upstream bytes, shell intact
+        const parts = responseOf(frameJson(replay.chunk)).candidates[0].content.parts;
+        assert.equal(parts[0].functionCall.name, "get_weather", "settle replay keeps the shelled call frame");
+    }
+});
+
+test("google parseStream v1internal: a top-level error frame passes through un-shelled", async () => {
+    const events = await collect(
+        createGoogleAdapter({}, undefined, undefined, "gemini-3-pro-preview", undefined, true),
+        sse({ error: { code: 500, message: "boom", status: "INTERNAL" } }),
+    );
+    assert.deepEqual(events.map((e) => e.kind), ["meta"], "error frame is handed through as a passthrough meta chunk");
+    const parsed = frameJson(events[0].chunk);
+    assert.equal(parsed.error?.status, "INTERNAL", "error payload intact");
+    assert.equal("response" in parsed, false, "no shell added to an error frame");
+});
