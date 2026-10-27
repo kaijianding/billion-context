@@ -5,9 +5,10 @@ import { recordNudgeInject } from "../cache-ledger.js";
 import { coreToGoogle, googleToCore, normalizeGoogleUserPartOrder, type BiliMessage, type GoogleContent, type GoogleRequestBody, type GoogleSystemInstruction, type GoogleTool } from "acp-kernel/wire";
 import type { ProxyOptions } from "../config.js";
 import { pluginAgentHeader } from "../plugin.js";
-import { currentCalibrationFactor } from "../util.js";
-import { diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, usageGradeInputBaseline, type Prepared } from "../server.js";
+import { currentCalibrationFactor, ensureGoogleClaudeWireOrder, isClaudeModel } from "../util.js";
+import { diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, makeFoldPointReasoningDroppable, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, usageGradeInputBaseline, type Prepared } from "../server.js";
 import { recordNudgeObservation } from "../context-analysis.js";
+import { isStrictReasoningEcho } from "../strict-echo.js";
 import { yieldToEventLoop } from "../yield-loop.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
 import { excludeDeadRefRanges } from "../acp-status.js";
@@ -45,6 +46,12 @@ function appendGoogleNudge(contents: GoogleContent[], text: string, model?: stri
     const last = contents[contents.length - 1];
     if (last && (last.role ?? "user") !== "model") {
         const parts = Array.isArray(last.parts) ? last.parts : [];
+        if (isClaudeModel(model)) {
+            return [
+                ...contents.slice(0, -1),
+                { ...last, parts: [...parts, { text }] },
+            ];
+        }
         // #3159: a plain-text tail after a functionResponse part 400s on
         // Vertex — normalize so the new text leads (#5390: skipped for Claude
         // targets, whose Anthropic-behind-Google backend wants tool_result first).
@@ -303,6 +310,7 @@ export async function prepareGoogle(
         // stay in session state/persistence untouched.
         const egressMessages = await applyImageRescalePass(processedMessages as BiliMessage[], { session, sessionId, log, maxDim: imageRescaleMaxDim(), toolArmed: imageRescaleToolArmed(session) });
         rebuiltContents = coreToGoogle(egressMessages, { model });
+        if (isClaudeModel(model)) rebuiltContents = ensureGoogleClaudeWireOrder(rebuiltContents);
 
         // ONLY the static compress prompt joins the client's system text — the
         // system instruction is the prefix-cache anchor and must stay
@@ -445,6 +453,7 @@ export function prepareGoogleCountTokens(
         const turn = core.processTurn({ messages: msgs, state: session.state, config: ccrLoopConfig(session, config), tokenCount: usageGradeInputBaseline(session), renderTags: knobRenderNone() ? "none" : "text-only", contentStore: contentStoreOf(session) });
         const stripped = stripKernelSummaries(turn.messages, turn.state);
         const rebuilt: GoogleRequestBody = { ...parsed, contents: coreToGoogle(stripped as BiliMessage[], { model }) };
+        if (isClaudeModel(model)) rebuilt.contents = ensureGoogleClaudeWireOrder(rebuilt.contents ?? []);
         log("info", `[${sessionId}] countTokens pruned: ${msgs.length} → ${stripped.length} msgs`);
         return {
             body: JSON.stringify(rebuilt),
