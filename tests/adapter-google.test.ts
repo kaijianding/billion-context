@@ -497,3 +497,26 @@ test("google parseStream v1internal: a top-level error frame passes through un-s
         assert.equal("response" in parsed, false, "no shell added to an error frame");
     }
 });
+
+test("google buildRequest: ensure tool_result precedes text for Claude models on Google wire", () => {
+    const messages: CoreMessage[] = [
+        { id: "m1", role: "assistant", contentType: "tool-call", toolName: "read", toolCallId: "toolu_123", text: "{}" },
+        { id: "m2", role: "tool", contentType: "tool-result", toolName: "read", toolCallId: "toolu_123", text: "file content" },
+        { id: "m3", role: "user", contentType: "text", text: "<system-notice>\nBackground job completed" },
+    ];
+    // Gemini model: normal kernel order (text before functionResponse per #3159)
+    const geminiAdapter = createGoogleAdapter({}, undefined, undefined, "gemini-3.8-flash-high");
+    const geminiBody = geminiAdapter.buildRequest(messages, "prompt", {});
+    const geminiContents = geminiBody.contents as Array<{ role: string; parts: Array<Record<string, unknown>> }>;
+    const geminiUserParts = geminiContents[1].parts;
+    assert.equal(geminiUserParts[0].text !== undefined, true, "Gemini allows text before functionResponse");
+
+    // Claude model: functionResponse MUST precede text for Anthropic tool_result pairing
+    const claudeAdapter = createGoogleAdapter({}, undefined, undefined, "claude-opus-5-5-high");
+    const claudeBody = claudeAdapter.buildRequest(messages, "prompt", {});
+    const claudeContents = claudeBody.contents as Array<{ role: string; parts: Array<Record<string, unknown>> }>;
+    const claudeUserParts = claudeContents[1].parts;
+    assert.equal(claudeUserParts[0].functionResponse !== undefined, true, "Claude wire requires functionResponse as leading part");
+    assert.equal((claudeUserParts[0].functionResponse as Record<string, unknown>).id, "toolu_123");
+    assert.equal(claudeUserParts[1].text !== undefined, true, "subsequent text parts trail functionResponse");
+});

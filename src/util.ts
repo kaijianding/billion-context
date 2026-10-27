@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import type { AnthropicRequestBody } from "acp-kernel/wire";
+import type { AnthropicRequestBody, GoogleContent, GooglePart } from "acp-kernel/wire";
 
 // #920: stamped per request by the opencode thin plugin for LEGACY
 // opencode-acp sessions (acp state on disk). The proxy (server.ts) forwards
@@ -875,4 +875,35 @@ export function rewrapAntigravityEnvelope(shell: Record<string, unknown> | undef
     } catch {
         return body;
     }
+}
+
+/** True when the model name indicates an Anthropic Claude model. */
+export function isClaudeModel(model: string | undefined): boolean {
+    if (!model) return false;
+    return /claude/i.test(model);
+}
+
+/**
+ * Anthropic wire compatibility on the Google protocol:
+ * When Claude is called via Google Cloud Code Assist / Antigravity, Google translates
+ * Gemini `contents` to Anthropic `messages`. Anthropic enforces that a `tool_use`
+ * block MUST be followed immediately by its corresponding `tool_result` in the next
+ * user message. Plain text parts can never precede `functionResponse` parts, or
+ * Vertex AI Claude rejects the request with a 400 error:
+ * "messages.N: `tool_use` ids were found without `tool_result` blocks immediately after".
+ */
+export function ensureGoogleClaudeWireOrder(contents: GoogleContent[]): GoogleContent[] {
+    return contents.map((c) => {
+        if (c.role !== "user" || !Array.isArray(c.parts)) return c;
+        const frs: GooglePart[] = [];
+        const texts: GooglePart[] = [];
+        const others: GooglePart[] = [];
+        for (const p of c.parts) {
+            if (p.functionResponse !== undefined) frs.push(p);
+            else if (typeof p.text === "string") texts.push(p);
+            else others.push(p);
+        }
+        if (frs.length === 0 || texts.length === 0) return c;
+        return { ...c, parts: [...frs, ...texts, ...others] };
+    });
 }

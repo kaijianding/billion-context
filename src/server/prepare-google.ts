@@ -4,7 +4,7 @@ import { renderNudgeText, viableRanges } from "acp-kernel";
 import { coreToGoogle, googleToCore, normalizeGoogleUserPartOrder, type BiliMessage, type GoogleContent, type GoogleRequestBody, type GoogleSystemInstruction, type GoogleTool } from "acp-kernel/wire";
 import type { ProxyOptions } from "../config.js";
 import { pluginAgentHeader } from "../plugin.js";
-import { currentCalibrationFactor } from "../util.js";
+import { currentCalibrationFactor, ensureGoogleClaudeWireOrder, isClaudeModel } from "../util.js";
 import { diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, usageGradeInputBaseline, type Prepared } from "../server.js";
 import { yieldToEventLoop } from "../yield-loop.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
@@ -36,10 +36,16 @@ import { effectiveAbsorbBlock } from "./prepare-responses.js";
 import { injectGoogleTool, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
 
-function appendGoogleNudge(contents: GoogleContent[], text: string): GoogleContent[] {
+function appendGoogleNudge(contents: GoogleContent[], text: string, isClaude = false): GoogleContent[] {
     const last = contents[contents.length - 1];
     if (last && (last.role ?? "user") !== "model") {
         const parts = Array.isArray(last.parts) ? last.parts : [];
+        if (isClaude) {
+            return [
+                ...contents.slice(0, -1),
+                { ...last, parts: [...parts, { text }] },
+            ];
+        }
         // #3159: a plain-text tail after a functionResponse part 400s on
         // Vertex — normalize so the new text leads.
         return [
@@ -285,6 +291,9 @@ export async function prepareGoogle(
         // stay in session state/persistence untouched.
         const egressMessages = await applyImageRescalePass(processedMessages as BiliMessage[], { session, sessionId, log, maxDim: imageRescaleMaxDim(), toolArmed: imageRescaleToolArmed(session) });
         rebuiltContents = coreToGoogle(egressMessages);
+        if (isClaudeModel(model)) {
+            rebuiltContents = ensureGoogleClaudeWireOrder(rebuiltContents);
+        }
 
         // ONLY the static compress prompt joins the client's system text — the
         // system instruction is the prefix-cache anchor and must stay
@@ -318,7 +327,7 @@ export async function prepareGoogle(
             toolsOut = injectGoogleTool(parsed.tools, [...(absorbActive ? [absorbTools.google] : []), ...(rulesActive ? [RULE_TOOL_GOOGLE] : []), ...(ccrEnabled(session) ? [retrieveToolsFor(retrieveToolName(session)).google] : []), ...(imageRescaleToolArmed(session) ? [READ_ORIGINAL_IMAGE_TOOL_GOOGLE] : [])], surface?.toolPrompts, ccrEnabled(session), externalSummaryEnabled(config));
         }
         if (sysNotes.length > 0) {
-            rebuiltContents = appendGoogleNudge(rebuiltContents, sysNotes.join("\n\n---\n\n"));
+            rebuiltContents = appendGoogleNudge(rebuiltContents, sysNotes.join("\n\n---\n\n"), isClaudeModel(model));
         }
         if (willInjectNudge && turn.nudge) {
             // #2228: model-decided timing (see prepareAnthropic for the policy):
@@ -427,7 +436,10 @@ export function prepareGoogleCountTokens(
         // counted, but nothing is adopted (state is discarded here too).
         const turn = core.processTurn({ messages: msgs, state: session.state, config: ccrLoopConfig(session, config), tokenCount: usageGradeInputBaseline(session), renderTags: knobRenderNone() ? "none" : "text-only", contentStore: contentStoreOf(session) });
         const stripped = stripKernelSummaries(turn.messages, turn.state);
-        const rebuilt: GoogleRequestBody = { ...parsed, contents: coreToGoogle(stripped as BiliMessage[]) };
+        let contents = coreToGoogle(stripped as BiliMessage[]);
+        const m = typeof session.metadata?.lastModel === "string" ? session.metadata.lastModel : undefined;
+        if (isClaudeModel(m)) contents = ensureGoogleClaudeWireOrder(contents);
+        const rebuilt: GoogleRequestBody = { ...parsed, contents };
         log("info", `[${sessionId}] countTokens pruned: ${msgs.length} → ${stripped.length} msgs`);
         return {
             body: JSON.stringify(rebuilt),
