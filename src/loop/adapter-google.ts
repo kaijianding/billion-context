@@ -6,7 +6,7 @@ import { composeStreamFilters, createBiliArtifactFilter, createMarkerLineFilter,
 import { degenerateTurnWarning } from "../degenerate-turn.js";
 import { log as loggerLog } from "../logger.js";
 import { normalizeSseLineEndings, finalizeSseLineEndings } from "../sse-util.js";
-import { ensureGoogleClaudeWireOrder, isClaudeModel, unwrapAntigravityEnvelope } from "../util.js";
+import { ensureGoogleClaudeWireOrder, ensureGoogleThoughtSignatures, isClaudeModel, unwrapAntigravityEnvelope } from "../util.js";
 
 import type {
     CompressLoopAdapter,
@@ -288,6 +288,7 @@ export function createGoogleAdapter(
             if (isClaudeModel(modelVersion)) {
                 contents = ensureGoogleClaudeWireOrder(contents);
             }
+            contents = ensureGoogleThoughtSignatures(contents);
             if (notes && notes.length > 0) {
                 for (const text of notes) contents.push({ role: "user", parts: [{ text }] });
             }

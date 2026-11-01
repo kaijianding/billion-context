@@ -520,3 +520,21 @@ test("google buildRequest: ensure tool_result precedes text for Claude models on
     assert.equal((claudeUserParts[0].functionResponse as Record<string, unknown>).id, "toolu_123");
     assert.equal(claudeUserParts[1].text !== undefined, true, "subsequent text parts trail functionResponse");
 });
+
+test("google buildRequest: ensure functionCall parts carry thoughtSignature or fallback sentinel", () => {
+    const messages: CoreMessage[] = [
+        { id: "m1", role: "assistant", contentType: "tool-call", toolName: "read", toolCallId: "call_1", text: "{\"path\":\"a.txt\"}" },
+        { id: "m2", role: "assistant", contentType: "tool-call", toolName: "glob", toolCallId: "call_2", text: "{}" },
+        { id: "m3", role: "tool", contentType: "tool-result", toolName: "read", toolCallId: "call_1", text: "content" },
+        { id: "m4", role: "tool", contentType: "tool-result", toolName: "glob", toolCallId: "call_2", text: "files" },
+    ];
+    const adapter = createGoogleAdapter({}, undefined, undefined, "gemini-4-argon-high");
+    const body = adapter.buildRequest(messages, "prompt", {});
+    const contents = body.contents as Array<{ role: string; parts: Array<Record<string, unknown>> }>;
+    const modelParts = contents[0].parts;
+    assert.equal(modelParts.length, 2, "2 tool calls emitted");
+    assert.equal(modelParts[0].functionCall !== undefined, true);
+    assert.equal(modelParts[0].thoughtSignature, "skip_thought_signature_validator", "missing signature gets fallback sentinel");
+    assert.equal(modelParts[1].functionCall !== undefined, true);
+    assert.equal(modelParts[1].thoughtSignature, "skip_thought_signature_validator", "missing signature on parallel call gets fallback sentinel");
+});
