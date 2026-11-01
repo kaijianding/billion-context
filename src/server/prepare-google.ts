@@ -5,7 +5,7 @@ import { recordNudgeInject } from "../cache-ledger.js";
 import { coreToGoogle, googleToCore, normalizeGoogleUserPartOrder, type BiliMessage, type GoogleContent, type GoogleRequestBody, type GoogleSystemInstruction, type GoogleTool } from "acp-kernel/wire";
 import type { ProxyOptions } from "../config.js";
 import { pluginAgentHeader } from "../plugin.js";
-import { currentCalibrationFactor, ensureGoogleClaudeWireOrder, isClaudeModel } from "../util.js";
+import { currentCalibrationFactor, ensureGoogleClaudeWireOrder, ensureGoogleThoughtSignatures, isClaudeModel } from "../util.js";
 import { diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, makeFoldPointReasoningDroppable, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, usageGradeInputBaseline, type Prepared } from "../server.js";
 import { recordNudgeObservation } from "../context-analysis.js";
 import { isStrictReasoningEcho } from "../strict-echo.js";
@@ -407,7 +407,8 @@ export async function prepareGoogle(
         processedMessages = [];
     }
 
-    const finalContents = isClaudeModel(model) ? ensureGoogleClaudeWireOrder(rebuiltContents) : rebuiltContents;
+    let finalContents = isClaudeModel(model) ? ensureGoogleClaudeWireOrder(rebuiltContents) : rebuiltContents;
+    finalContents = ensureGoogleThoughtSignatures(finalContents);
     const rebuilt: GoogleRequestBody = { ...parsed, contents: finalContents, tools: toolsOut, systemInstruction };
     clampOutgoingOutput(rebuilt as Record<string, unknown>, "generationConfig.maxOutputTokens", { systemText: googleClientSystem, tools: toolsOut, processedMessages, lastInputTokens: session.stats.lastInputTokens, lastInputTokensSource: session.stats.lastInputTokensSource, nativeWindow, headroomWindow: config.modelContextLimit, imageTokens: imageReserveFor(session, "google", rebuilt, opts, upstreamOrigin), kFactor: currentCalibrationFactor(session.stats, session.metadata?.lastModel), kOrigin: session.stats.calibratedEstimateOrigin, origin: upstreamOrigin, ledgerFloorTokens: dshLedgerFloorTokens(session.metadata), knownOutputCeiling: resolveKnownOutputCeiling(req.headers, parsed as Record<string, unknown>, opts.routes, upstreamOrigin, opts.sessionHeader, model) }, sessionId, log, (c) => { session.stats.lastOutputClamp = { ...c, at: Date.now() }; });
     // #532: title-gen side requests carry their own tiny system — skip them.
@@ -453,8 +454,10 @@ export function prepareGoogleCountTokens(
         // counted, but nothing is adopted (state is discarded here too).
         const turn = core.processTurn({ messages: msgs, state: session.state, config: ccrLoopConfig(session, config), tokenCount: usageGradeInputBaseline(session), renderTags: knobRenderNone() ? "none" : "text-only", contentStore: contentStoreOf(session) });
         const stripped = stripKernelSummaries(turn.messages, turn.state);
-        const rebuilt: GoogleRequestBody = { ...parsed, contents: coreToGoogle(stripped as BiliMessage[], { model }) };
-        if (isClaudeModel(model)) rebuilt.contents = ensureGoogleClaudeWireOrder(rebuilt.contents ?? []);
+        let contents = coreToGoogle(stripped as BiliMessage[], { model });
+        if (isClaudeModel(model)) contents = ensureGoogleClaudeWireOrder(contents);
+        contents = ensureGoogleThoughtSignatures(contents);
+        const rebuilt: GoogleRequestBody = { ...parsed, contents };
         log("info", `[${sessionId}] countTokens pruned: ${msgs.length} → ${stripped.length} msgs`);
         return {
             body: JSON.stringify(rebuilt),
