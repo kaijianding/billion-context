@@ -278,7 +278,7 @@ export function createGoogleAdapter(
             if (isClaudeModel(modelVersion)) {
                 contents = ensureGoogleClaudeWireOrder(contents);
             }
-            contents = ensureGoogleThoughtSignatures(contents);
+            contents = ensureGoogleThoughtSignatures(contents, modelVersion);
             if (notes && notes.length > 0) {
                 for (const text of notes) contents.push({ role: "user", parts: [{ text }] });
             }

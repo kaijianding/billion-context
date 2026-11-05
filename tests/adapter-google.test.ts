@@ -389,4 +389,15 @@ test("google buildRequest: ensure functionCall parts carry thoughtSignature or f
     assert.equal(modelParts[0].thoughtSignature, "skip_thought_signature_validator", "missing signature gets fallback sentinel");
     assert.equal(modelParts[1].functionCall !== undefined, true);
     assert.equal(modelParts[1].thoughtSignature, "skip_thought_signature_validator", "missing signature on parallel call gets fallback sentinel");
+
+    // Claude models: the sentinel is NOT a valid Anthropic thinking signature —
+    // upstream rejects it with "Invalid `signature` in `thinking` block"
+    // (messages.N.content.0), so those parts must stay unsigned.
+    const claudeAdapter = createGoogleAdapter({}, undefined, undefined, "claude-opus-5-5-high");
+    const claudeBody = claudeAdapter.buildRequest(messages, "prompt", {});
+    const claudeParts = (claudeBody.contents as Array<{ role: string; parts: Array<Record<string, unknown>> }>)[0].parts;
+    assert.equal(claudeParts.length, 2, "2 tool calls emitted for Claude too");
+    assert.equal(claudeParts[0].functionCall !== undefined, true);
+    assert.equal(claudeParts[0].thoughtSignature, undefined, "Claude keeps unsigned functionCall parts unsigned");
+    assert.equal(claudeParts[1].thoughtSignature, undefined, "Claude keeps parallel unsigned calls unsigned");
 });
