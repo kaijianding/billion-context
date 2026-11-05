@@ -2294,6 +2294,11 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
         // signal, or end raw for permitlist hosts that own the handling.)
         try {
             let pluginBody = upstream.body as ReadableStream<Uint8Array>;
+            // #3129: unwrap v1internal frames before downstream stream processors inspect them.
+            if (v1Active && prepared !== null) {
+                installV1ResponseFramer(res);
+                pluginBody = v1UnwrapStream(pluginBody);
+            }
             // #1295: the JSONL wire has no fake-completion shape to detect —
             // its finish event IS the terminal frame.
             if (prepared.stream && !prepared.commandcode && maxFakeCompletionRetries() > 0) {
@@ -2316,6 +2321,9 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                     model: prepared.model ?? prepared.google?.model,
                 });
                 pluginBody = bufferToStream(resolvedBuf);
+                // The fake-completion re-send streams the same shelled wire, and
+                // unwrap is idempotent (plain frames pass through), so re-apply it.
+                if (v1Active && prepared !== null) pluginBody = v1UnwrapStream(pluginBody);
             }
             // #2347: raw-dump twin of the tee below — this branch returns
             // before reaching it, so plugin-mode turns need their own.

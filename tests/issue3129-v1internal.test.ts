@@ -279,6 +279,51 @@ test("#3129 A: an enveloped Antigravity turn round-trips the envelope end-to-end
     }
 });
 
+test("#3129 F: the plugin lane unwraps shells before its stream pipe sees them", async () => {
+    // Regression: `prepared.pluginMode` streams `upstream.body` verbatim, so
+    // without the dialect layer the pipe's google processor finds no top-level
+    // `candidates`/`finishReason`, never sets its terminal flag, and reports a
+    // healthy 200 stream as `upstream stream truncated` — every tool call in the
+    // turn is discarded client-side.
+    const calls: Call[] = [];
+    const upstream = makeUpstream(calls);
+    upstream.listen(0, "127.0.0.1");
+    await once(upstream, "listening");
+    const upstreamPort = (upstream.address() as { port: number }).port;
+    const proxy = await startProxy(upstreamPort);
+    await once(proxy, "listening");
+    const proxyPort = (proxy.address() as { port: number }).port;
+    try {
+        const resp = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1internal:streamGenerateContent?alt=sse`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-bili-plugin": "omp" },
+            body: JSON.stringify(v1Request({ convId: CONV_ID, tools: true })),
+        });
+        const text = await resp.text();
+        assert.equal(resp.status, 200, `plugin lane must accept the turn, got HTTP ${resp.status}: ${text.slice(0, 300)}`);
+        assert.ok(
+            !/upstream stream (?:ended before a completion event|truncated)/.test(text),
+            `a terminated turn must not be reported as a truncation, got: ${text.slice(0, 400)}`,
+        );
+        const frames = ssePayloads(text);
+        assert.ok(frames.length >= 1, `expected at least one SSE frame, got: ${text.slice(0, 300)}`);
+        for (const f of frames) {
+            assert.ok(typeof f === "object" && f !== null && "response" in f, "client frame re-wrapped in {response}");
+        }
+        const terminal = frames.some((f) => {
+            if (typeof f !== "object" || f === null || !("response" in f)) return false;
+            const inner = f.response;
+            if (typeof inner !== "object" || inner === null || !("candidates" in inner)) return false;
+            const cands = inner.candidates;
+            return Array.isArray(cands) && cands.some((c) => typeof c === "object" && c !== null && "finishReason" in c && c.finishReason === "STOP");
+        });
+        assert.ok(terminal, "the terminal finishReason survives the pipe");
+        assert.match(text, /hello from cloudcode/);
+    } finally {
+        proxy.close(); upstream.close();
+    }
+});
+
 test("#3129 B: a CLI-style request with no Conversation ID still resolves identity", async () => {
     const calls: Call[] = [];
     const upstream = makeUpstream(calls);
