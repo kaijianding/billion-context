@@ -1736,6 +1736,19 @@ async function forwardCaptured(
         // signal, or end raw for permitlist hosts that own the handling.)
         try {
             let pluginBody = upstream.body as ReadableStream<Uint8Array>;
+            // #3129: the v1internal dialect must own the shells on THIS lane too.
+            // `v1Active` unwraps every upstream frame so the pipes below see a
+            // standard GenerateContentResponse — their google processor reads
+            // top-level `candidates`/`finishReason`, so a shelled frame parses as
+            // "no terminal event" and every turn gets misreported as an upstream
+            // truncation. The response framer re-nests whatever they write back
+            // (prose, synthesized acp_status / Compressed markers) into the
+            // {"response":…} envelope the client requires. Placed before
+            // resolveFakeCompletion so its visibility check reads real text.
+            if (v1Active && prepared !== null) {
+                installV1ResponseFramer(res);
+                pluginBody = v1UnwrapStream(pluginBody);
+            }
             if (prepared.stream && maxFakeCompletionRetries() > 0) {
                 // #1900: retry from wireBody — the exact bytes this request's main
                 // attempt shipped (post wireTransform and any same-request re-send),
@@ -1755,6 +1768,9 @@ async function forwardCaptured(
                     log,
                 });
                 pluginBody = bufferToStream(resolvedBuf);
+                // The fake-completion re-send streams the same shelled wire, and
+                // unwrap is idempotent (plain frames pass through), so re-apply it.
+                if (v1Active && prepared !== null) pluginBody = v1UnwrapStream(pluginBody);
             }
             // #2347: raw-dump twin of the tee below — this branch returns
             // before reaching it, so plugin-mode turns need their own.
