@@ -408,7 +408,7 @@ export async function prepareGoogle(
     }
 
     let finalContents = isClaudeModel(model) ? ensureGoogleClaudeWireOrder(rebuiltContents) : rebuiltContents;
-    finalContents = ensureGoogleThoughtSignatures(finalContents);
+    finalContents = ensureGoogleThoughtSignatures(finalContents, model);
     const rebuilt: GoogleRequestBody = { ...parsed, contents: finalContents, tools: toolsOut, systemInstruction };
     clampOutgoingOutput(rebuilt as Record<string, unknown>, "generationConfig.maxOutputTokens", { systemText: googleClientSystem, tools: toolsOut, processedMessages, lastInputTokens: session.stats.lastInputTokens, lastInputTokensSource: session.stats.lastInputTokensSource, nativeWindow, headroomWindow: config.modelContextLimit, imageTokens: imageReserveFor(session, "google", rebuilt, opts, upstreamOrigin), kFactor: currentCalibrationFactor(session.stats, session.metadata?.lastModel), kOrigin: session.stats.calibratedEstimateOrigin, origin: upstreamOrigin, ledgerFloorTokens: dshLedgerFloorTokens(session.metadata), knownOutputCeiling: resolveKnownOutputCeiling(req.headers, parsed as Record<string, unknown>, opts.routes, upstreamOrigin, opts.sessionHeader, model) }, sessionId, log, (c) => { session.stats.lastOutputClamp = { ...c, at: Date.now() }; });
     // #532: title-gen side requests carry their own tiny system — skip them.
@@ -456,7 +456,7 @@ export function prepareGoogleCountTokens(
         const stripped = stripKernelSummaries(turn.messages, turn.state);
         let contents = coreToGoogle(stripped as BiliMessage[], { model });
         if (isClaudeModel(model)) contents = ensureGoogleClaudeWireOrder(contents);
-        contents = ensureGoogleThoughtSignatures(contents);
+        contents = ensureGoogleThoughtSignatures(contents, model);
         const rebuilt: GoogleRequestBody = { ...parsed, contents };
         log("info", `[${sessionId}] countTokens pruned: ${msgs.length} → ${stripped.length} msgs`);
         return {
