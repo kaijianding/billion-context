@@ -820,13 +820,25 @@ export function isClaudeModel(model: string | undefined): boolean {
  * here: `skip_thought_signature_validator` is not a signature on this wire
  * (see ensureGoogleThoughtSignatures), so an unsigned thought part is dropped
  * instead. Thinking blocks are optional in history, so the turn stays legal.
+ *
+ * The translation also carries only ONE signature per content: a second
+ * `{thought:true}` part in the same content becomes a thinking block with no
+ * signature, failing with the same 400 (measured by replaying a rejected body
+ * with the second thought removed -> 200). The kernel fuses consecutive model
+ * cores into one content, so two reasoning cores reliably produce that shape;
+ * only the first thought part of a content is kept.
  */
 export function ensureGoogleClaudeWireRules(contents: GoogleContent[]): GoogleContent[] {
     return contents.map((c) => {
         if (!Array.isArray(c.parts)) return c;
-        const kept = c.parts.filter(
-            (p) => !(p.thought === true && (typeof p.thoughtSignature !== "string" || p.thoughtSignature.length === 0)),
-        );
+        let thoughtSeen = false;
+        const kept = c.parts.filter((p) => {
+            if (p.thought !== true) return true;
+            if (thoughtSeen) return false;
+            if (typeof p.thoughtSignature !== "string" || p.thoughtSignature.length === 0) return false;
+            thoughtSeen = true;
+            return true;
+        });
         if (c.role !== "user") return kept.length === c.parts.length ? c : { ...c, parts: kept };
         const frs: GooglePart[] = [];
         const texts: GooglePart[] = [];

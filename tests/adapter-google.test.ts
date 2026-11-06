@@ -461,3 +461,25 @@ test("google buildRequest: Claude drops thought parts that carry no signature at
     assert.equal(thoughts.length, 1, "only the signed thought survives on the Claude wire");
     assert.equal(thoughts[0].thoughtSignature, signature);
 });
+
+test("google buildRequest: Claude keeps one thinking part per content", () => {
+    // Two reasoning cores fuse into a single model content, and the Anthropic
+    // translation carries only one signature per content: the second thinking
+    // block lands without one and upstream rejects the turn with
+    // "messages.N.content.1.thinking.signature: Field required"
+    // (verified: replaying the rejected body minus that part returns 200).
+    const sig = (fill: string) => `Q0FRU3JRY0tFZ2dURUFJWUFq${fill.repeat(64)}`;
+    const messages = [
+        { id: "m1", role: "user", contentType: "text", text: "hi" },
+        { id: "m2", role: "assistant", contentType: "reasoning", text: "first thought", googleThoughtSignature: sig("A") },
+        { id: "m3", role: "assistant", contentType: "reasoning", text: "second thought", googleThoughtSignature: sig("B") },
+        { id: "m4", role: "assistant", contentType: "tool-call", toolName: "read", toolCallId: "call_1", text: "{}" },
+    ] as unknown as CoreMessage[];
+
+    const claudeBody = createGoogleAdapter({}, undefined, undefined, "claude-opus-5-5-high").buildRequest(messages, "prompt", {});
+    const claudeParts = (claudeBody.contents as Array<{ parts: Array<Record<string, unknown>> }>)[1].parts;
+    const thoughts = claudeParts.filter((p) => p.thought === true);
+    assert.equal(thoughts.length, 1, "a content carries at most one thinking block on the Claude wire");
+    assert.equal(thoughts[0].text, "first thought");
+    assert.equal(claudeParts.some((p) => p.functionCall !== undefined), true, "the tool call still ships");
+});
