@@ -5,7 +5,7 @@ import { recordNudgeInject } from "../cache-ledger.js";
 import { coreToGoogle, googleToCore, normalizeGoogleUserPartOrder, type BiliMessage, type GoogleContent, type GoogleRequestBody, type GoogleSystemInstruction, type GoogleTool } from "acp-kernel/wire";
 import type { ProxyOptions } from "../config.js";
 import { pluginAgentHeader } from "../plugin.js";
-import { currentCalibrationFactor, ensureGoogleClaudeWireOrder, ensureGoogleThoughtSignatures, isClaudeModel } from "../util.js";
+import { currentCalibrationFactor, ensureGoogleClaudeWireRules, ensureGoogleThoughtSignatures, isClaudeModel } from "../util.js";
 import { diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, makeFoldPointReasoningDroppable, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, usageGradeInputBaseline, type Prepared } from "../server.js";
 import { recordNudgeObservation } from "../context-analysis.js";
 import { isStrictReasoningEcho } from "../strict-echo.js";
@@ -310,7 +310,10 @@ export async function prepareGoogle(
         // stay in session state/persistence untouched.
         const egressMessages = await applyImageRescalePass(processedMessages as BiliMessage[], { session, sessionId, log, maxDim: imageRescaleMaxDim(), toolArmed: imageRescaleToolArmed(session) });
         rebuiltContents = coreToGoogle(egressMessages, { model });
-        if (isClaudeModel(model)) rebuiltContents = ensureGoogleClaudeWireOrder(rebuiltContents);
+        if (isClaudeModel(model)) {
+            rebuiltContents = ensureGoogleClaudeWireRules(rebuiltContents);
+        }
+        rebuiltContents = ensureGoogleThoughtSignatures(rebuiltContents, model);
 
         // ONLY the static compress prompt joins the client's system text — the
         // system instruction is the prefix-cache anchor and must stay
@@ -407,7 +410,7 @@ export async function prepareGoogle(
         processedMessages = [];
     }
 
-    let finalContents = isClaudeModel(model) ? ensureGoogleClaudeWireOrder(rebuiltContents) : rebuiltContents;
+    let finalContents = isClaudeModel(model) ? ensureGoogleClaudeWireRules(rebuiltContents) : rebuiltContents;
     finalContents = ensureGoogleThoughtSignatures(finalContents, model);
     const rebuilt: GoogleRequestBody = { ...parsed, contents: finalContents, tools: toolsOut, systemInstruction };
     clampOutgoingOutput(rebuilt as Record<string, unknown>, "generationConfig.maxOutputTokens", { systemText: googleClientSystem, tools: toolsOut, processedMessages, lastInputTokens: session.stats.lastInputTokens, lastInputTokensSource: session.stats.lastInputTokensSource, nativeWindow, headroomWindow: config.modelContextLimit, imageTokens: imageReserveFor(session, "google", rebuilt, opts, upstreamOrigin), kFactor: currentCalibrationFactor(session.stats, session.metadata?.lastModel), kOrigin: session.stats.calibratedEstimateOrigin, origin: upstreamOrigin, ledgerFloorTokens: dshLedgerFloorTokens(session.metadata), knownOutputCeiling: resolveKnownOutputCeiling(req.headers, parsed as Record<string, unknown>, opts.routes, upstreamOrigin, opts.sessionHeader, model) }, sessionId, log, (c) => { session.stats.lastOutputClamp = { ...c, at: Date.now() }; });
@@ -455,7 +458,7 @@ export function prepareGoogleCountTokens(
         const turn = core.processTurn({ messages: msgs, state: session.state, config: ccrLoopConfig(session, config), tokenCount: usageGradeInputBaseline(session), renderTags: knobRenderNone() ? "none" : "text-only", contentStore: contentStoreOf(session) });
         const stripped = stripKernelSummaries(turn.messages, turn.state);
         let contents = coreToGoogle(stripped as BiliMessage[], { model });
-        if (isClaudeModel(model)) contents = ensureGoogleClaudeWireOrder(contents);
+        if (isClaudeModel(model)) contents = ensureGoogleClaudeWireRules(contents);
         contents = ensureGoogleThoughtSignatures(contents, model);
         const rebuilt: GoogleRequestBody = { ...parsed, contents };
         log("info", `[${sessionId}] countTokens pruned: ${msgs.length} → ${stripped.length} msgs`);
