@@ -1,0 +1,118 @@
+From 992808a0c788b71ac9f946ddb192c874ce844a29 Mon Sep 17 00:00:00 2001
+From: "kaijian.ding" <kaijian.ding@gmail.com>
+Date: Thu, 5 Nov 2026 21:45:56 +0800
+Subject: [PATCH 5/8] fix(google): unwrap the v1internal shell on the plugin
+ lane too
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+`prepared.pluginMode` streams `upstream.body` verbatim, so the dialect layer
+that the proxy lane installs (#3129: `v1UnwrapStream` + `installV1ResponseFramer`)
+was skipped entirely. The pipes' google processor reads top-level
+`candidates`/`finishReason`, so a shelled frame parsed as "no terminal event":
+every healthy 200 turn ended as `upstream stream truncated` and the client
+discarded the whole turn's tool calls.
+
+Apply the same layer at the plugin lane's stream origin, before
+`resolveFakeCompletion` (its visibility check must read real text) and again on
+the re-sent buffer (idempotent: plain frames pass through). Regression test
+`#3129 F` pins it — red without the fix, green with it.
+---
+ src/server/relay.ts                | 16 +++++++++++
+ tests/issue3129-v1internal.test.ts | 45 ++++++++++++++++++++++++++++++
+ 2 files changed, 61 insertions(+)
+
+diff --git a/src/server/relay.ts b/src/server/relay.ts
+index d1d4b7318..9ec8d6743 100644
+--- a/src/server/relay.ts
++++ b/src/server/relay.ts
+@@ -1736,6 +1736,19 @@ async function forwardCaptured(
+         // signal, or end raw for permitlist hosts that own the handling.)
+         try {
+             let pluginBody = upstream.body as ReadableStream<Uint8Array>;
++            // #3129: the v1internal dialect must own the shells on THIS lane too.
++            // `v1Active` unwraps every upstream frame so the pipes below see a
++            // standard GenerateContentResponse — their google processor reads
++            // top-level `candidates`/`finishReason`, so a shelled frame parses as
++            // "no terminal event" and every turn gets misreported as an upstream
++            // truncation. The response framer re-nests whatever they write back
++            // (prose, synthesized acp_status / Compressed markers) into the
++            // {"response":…} envelope the client requires. Placed before
++            // resolveFakeCompletion so its visibility check reads real text.
++            if (v1Active && prepared !== null) {
++                installV1ResponseFramer(res);
++                pluginBody = v1UnwrapStream(pluginBody);
++            }
+             if (prepared.stream && maxFakeCompletionRetries() > 0) {
+                 // #1900: retry from wireBody — the exact bytes this request's main
+                 // attempt shipped (post wireTransform and any same-request re-send),
+@@ -1755,6 +1768,9 @@ async function forwardCaptured(
+                     log,
+                 });
+                 pluginBody = bufferToStream(resolvedBuf);
++                // The fake-completion re-send streams the same shelled wire, and
++                // unwrap is idempotent (plain frames pass through), so re-apply it.
++                if (v1Active && prepared !== null) pluginBody = v1UnwrapStream(pluginBody);
+             }
+             // #2347: raw-dump twin of the tee below — this branch returns
+             // before reaching it, so plugin-mode turns need their own.
+diff --git a/tests/issue3129-v1internal.test.ts b/tests/issue3129-v1internal.test.ts
+index de4eb0fb9..6af66b6a2 100644
+--- a/tests/issue3129-v1internal.test.ts
++++ b/tests/issue3129-v1internal.test.ts
+@@ -279,6 +279,51 @@ test("#3129 A: an enveloped Antigravity turn round-trips the envelope end-to-end
+     }
+ });
+ 
++test("#3129 F: the plugin lane unwraps shells before its stream pipe sees them", async () => {
++    // Regression: `prepared.pluginMode` streams `upstream.body` verbatim, so
++    // without the dialect layer the pipe's google processor finds no top-level
++    // `candidates`/`finishReason`, never sets its terminal flag, and reports a
++    // healthy 200 stream as `upstream stream truncated` — every tool call in the
++    // turn is discarded client-side.
++    const calls: Call[] = [];
++    const upstream = makeUpstream(calls);
++    upstream.listen(0, "127.0.0.1");
++    await once(upstream, "listening");
++    const upstreamPort = (upstream.address() as { port: number }).port;
++    const proxy = await startProxy(upstreamPort);
++    await once(proxy, "listening");
++    const proxyPort = (proxy.address() as { port: number }).port;
++    try {
++        const resp = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1internal:streamGenerateContent?alt=sse`, {
++            method: "POST",
++            headers: { "content-type": "application/json", "x-bili-plugin": "omp" },
++            body: JSON.stringify(v1Request({ convId: CONV_ID, tools: true })),
++        });
++        const text = await resp.text();
++        assert.equal(resp.status, 200, `plugin lane must accept the turn, got HTTP ${resp.status}: ${text.slice(0, 300)}`);
++        assert.ok(
++            !/upstream stream (?:ended before a completion event|truncated)/.test(text),
++            `a terminated turn must not be reported as a truncation, got: ${text.slice(0, 400)}`,
++        );
++        const frames = ssePayloads(text);
++        assert.ok(frames.length >= 1, `expected at least one SSE frame, got: ${text.slice(0, 300)}`);
++        for (const f of frames) {
++            assert.ok(typeof f === "object" && f !== null && "response" in f, "client frame re-wrapped in {response}");
++        }
++        const terminal = frames.some((f) => {
++            if (typeof f !== "object" || f === null || !("response" in f)) return false;
++            const inner = f.response;
++            if (typeof inner !== "object" || inner === null || !("candidates" in inner)) return false;
++            const cands = inner.candidates;
++            return Array.isArray(cands) && cands.some((c) => typeof c === "object" && c !== null && "finishReason" in c && c.finishReason === "STOP");
++        });
++        assert.ok(terminal, "the terminal finishReason survives the pipe");
++        assert.match(text, /hello from cloudcode/);
++    } finally {
++        proxy.close(); upstream.close();
++    }
++});
++
+ test("#3129 B: a CLI-style request with no Conversation ID still resolves identity", async () => {
+     const calls: Call[] = [];
+     const upstream = makeUpstream(calls);
+-- 
+2.54.0 (Apple Git-157)
+

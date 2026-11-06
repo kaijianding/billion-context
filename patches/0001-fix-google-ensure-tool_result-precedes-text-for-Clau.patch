@@ -1,0 +1,178 @@
+From 6e443171a3f6856f87da288d8a73ff5ce69ed4b2 Mon Sep 17 00:00:00 2001
+From: kaijianding <kaijian.ding@gmail.com>
+Date: Wed, 28 Oct 2026 04:08:24 +0800
+Subject: [PATCH 1/8] fix(google): ensure tool_result precedes text for Claude
+ models on Google wire
+
+---
+ src/loop/adapter-google.ts   |  6 +++++-
+ src/server/prepare-google.ts | 20 ++++++++++++++++----
+ src/util.ts                  | 32 +++++++++++++++++++++++++++++++-
+ tests/adapter-google.test.ts | 23 +++++++++++++++++++++++
+ 4 files changed, 75 insertions(+), 6 deletions(-)
+
+diff --git a/src/loop/adapter-google.ts b/src/loop/adapter-google.ts
+index ab5e3f1c7..44ef8e67d 100644
+--- a/src/loop/adapter-google.ts
++++ b/src/loop/adapter-google.ts
+@@ -6,6 +6,7 @@ import { composeStreamFilters, createBiliArtifactFilter, createMarkerLineFilter,
+ import { degenerateTurnWarning } from "../degenerate-turn.js";
+ import { log as loggerLog } from "../logger.js";
+ import { normalizeSseLineEndings, finalizeSseLineEndings } from "../sse-util.js";
++import { ensureGoogleClaudeWireOrder, isClaudeModel } from "../util.js";
+ 
+ import type {
+     CompressLoopAdapter,
+@@ -273,7 +274,10 @@ export function createGoogleAdapter(
+ 
+     return {
+         buildRequest(coreMessages, systemPrompt, body) {
+-            const contents = coreToGoogle(coreMessages);
++            let contents = coreToGoogle(coreMessages);
++            if (isClaudeModel(modelVersion)) {
++                contents = ensureGoogleClaudeWireOrder(contents);
++            }
+             if (notes && notes.length > 0) {
+                 for (const text of notes) contents.push({ role: "user", parts: [{ text }] });
+             }
+diff --git a/src/server/prepare-google.ts b/src/server/prepare-google.ts
+index c13297053..858965623 100644
+--- a/src/server/prepare-google.ts
++++ b/src/server/prepare-google.ts
+@@ -4,7 +4,7 @@ import { renderNudgeText, viableRanges } from "acp-kernel";
+ import { coreToGoogle, googleToCore, normalizeGoogleUserPartOrder, type BiliMessage, type GoogleContent, type GoogleRequestBody, type GoogleSystemInstruction, type GoogleTool } from "acp-kernel/wire";
+ import type { ProxyOptions } from "../config.js";
+ import { pluginAgentHeader } from "../plugin.js";
+-import { currentCalibrationFactor } from "../util.js";
++import { currentCalibrationFactor, ensureGoogleClaudeWireOrder, isClaudeModel } from "../util.js";
+ import { diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, makeFoldPointReasoningDroppable, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, usageGradeInputBaseline, type Prepared } from "../server.js";
+ import { isStrictReasoningEcho } from "../strict-echo.js";
+ import { yieldToEventLoop } from "../yield-loop.js";
+@@ -37,10 +37,16 @@ import { effectiveAbsorbBlock } from "./prepare-responses.js";
+ import { injectGoogleTool, injectTool } from "./inject.js";
+ import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
+ 
+-function appendGoogleNudge(contents: GoogleContent[], text: string): GoogleContent[] {
++function appendGoogleNudge(contents: GoogleContent[], text: string, isClaude = false): GoogleContent[] {
+     const last = contents[contents.length - 1];
+     if (last && (last.role ?? "user") !== "model") {
+         const parts = Array.isArray(last.parts) ? last.parts : [];
++        if (isClaude) {
++            return [
++                ...contents.slice(0, -1),
++                { ...last, parts: [...parts, { text }] },
++            ];
++        }
+         // #3159: a plain-text tail after a functionResponse part 400s on
+         // Vertex — normalize so the new text leads.
+         return [
+@@ -289,6 +295,9 @@ export async function prepareGoogle(
+         // stay in session state/persistence untouched.
+         const egressMessages = await applyImageRescalePass(processedMessages as BiliMessage[], { session, sessionId, log, maxDim: imageRescaleMaxDim(), toolArmed: imageRescaleToolArmed(session) });
+         rebuiltContents = coreToGoogle(egressMessages);
++        if (isClaudeModel(model)) {
++            rebuiltContents = ensureGoogleClaudeWireOrder(rebuiltContents);
++        }
+ 
+         // ONLY the static compress prompt joins the client's system text — the
+         // system instruction is the prefix-cache anchor and must stay
+@@ -322,7 +331,7 @@ export async function prepareGoogle(
+             toolsOut = injectGoogleTool(parsed.tools, [...(absorbActive ? [absorbTools.google] : []), ...(rulesActive ? [RULE_TOOL_GOOGLE] : []), ...(ccrEnabled(session) ? [retrieveToolsFor(retrieveToolName(session)).google] : []), ...(imageRescaleToolArmed(session) ? [READ_ORIGINAL_IMAGE_TOOL_GOOGLE] : [])], surface?.toolPrompts, ccrEnabled(session), externalSummaryEnabled(config));
+         }
+         if (sysNotes.length > 0) {
+-            rebuiltContents = appendGoogleNudge(rebuiltContents, sysNotes.join("\n\n---\n\n"));
++            rebuiltContents = appendGoogleNudge(rebuiltContents, sysNotes.join("\n\n---\n\n"), isClaudeModel(model));
+         }
+         if (willInjectNudge && turn.nudge) {
+             // #2228: model-decided timing (see prepareAnthropic for the policy):
+@@ -431,7 +440,10 @@ export function prepareGoogleCountTokens(
+         // counted, but nothing is adopted (state is discarded here too).
+         const turn = core.processTurn({ messages: msgs, state: session.state, config: ccrLoopConfig(session, config), tokenCount: usageGradeInputBaseline(session), renderTags: knobRenderNone() ? "none" : "text-only", contentStore: contentStoreOf(session) });
+         const stripped = stripKernelSummaries(turn.messages, turn.state);
+-        const rebuilt: GoogleRequestBody = { ...parsed, contents: coreToGoogle(stripped as BiliMessage[]) };
++        let contents = coreToGoogle(stripped as BiliMessage[]);
++        const m = typeof session.metadata?.lastModel === "string" ? session.metadata.lastModel : undefined;
++        if (isClaudeModel(m)) contents = ensureGoogleClaudeWireOrder(contents);
++        const rebuilt: GoogleRequestBody = { ...parsed, contents };
+         log("info", `[${sessionId}] countTokens pruned: ${msgs.length} → ${stripped.length} msgs`);
+         return {
+             body: JSON.stringify(rebuilt),
+diff --git a/src/util.ts b/src/util.ts
+index c960263f5..e299d8202 100644
+--- a/src/util.ts
++++ b/src/util.ts
+@@ -1,5 +1,5 @@
+ import { createHash } from "node:crypto";
+-import type { AnthropicRequestBody } from "acp-kernel/wire";
++import type { AnthropicRequestBody, GoogleContent, GooglePart } from "acp-kernel/wire";
+ 
+ // #920: stamped per request by the opencode thin plugin for LEGACY
+ // opencode-acp sessions (acp state on disk). The proxy (server.ts) forwards
+@@ -798,3 +798,33 @@ function blockText(v: unknown): string | undefined {
+     }
+     return undefined;
+ }
++/** True when the model name indicates an Anthropic Claude model. */
++export function isClaudeModel(model: string | undefined): boolean {
++    if (!model) return false;
++    return /claude/i.test(model);
++}
++
++/**
++ * Anthropic wire compatibility on the Google protocol:
++ * When Claude is called via Google Cloud Code Assist / Antigravity, Google translates
++ * Gemini `contents` to Anthropic `messages`. Anthropic enforces that a `tool_use`
++ * block MUST be followed immediately by its corresponding `tool_result` in the next
++ * user message. Plain text parts can never precede `functionResponse` parts, or
++ * Vertex AI Claude rejects the request with a 400 error:
++ * "messages.N: `tool_use` ids were found without `tool_result` blocks immediately after".
++ */
++export function ensureGoogleClaudeWireOrder(contents: GoogleContent[]): GoogleContent[] {
++    return contents.map((c) => {
++        if (c.role !== "user" || !Array.isArray(c.parts)) return c;
++        const frs: GooglePart[] = [];
++        const texts: GooglePart[] = [];
++        const others: GooglePart[] = [];
++        for (const p of c.parts) {
++            if (p.functionResponse !== undefined) frs.push(p);
++            else if (typeof p.text === "string") texts.push(p);
++            else others.push(p);
++        }
++        if (frs.length === 0 || texts.length === 0) return c;
++        return { ...c, parts: [...frs, ...texts, ...others] };
++    });
++}
+diff --git a/tests/adapter-google.test.ts b/tests/adapter-google.test.ts
+index ac3c7f6d3..8033ba02a 100644
+--- a/tests/adapter-google.test.ts
++++ b/tests/adapter-google.test.ts
+@@ -349,3 +349,26 @@ test("google parseStream: a null sibling part does not break the edited frame",
+     const frames = framesOf(events);
+     assert.ok(frames.some((f) => f.includes("kept prose")), `the prose still reaches the client, got: ${frames.join(" | ")}`);
+ });
++
++test("google buildRequest: ensure tool_result precedes text for Claude models on Google wire", () => {
++    const messages: CoreMessage[] = [
++        { id: "m1", role: "assistant", contentType: "tool-call", toolName: "read", toolCallId: "toolu_123", text: "{}" },
++        { id: "m2", role: "tool", contentType: "tool-result", toolName: "read", toolCallId: "toolu_123", text: "file content" },
++        { id: "m3", role: "user", contentType: "text", text: "<system-notice>\nBackground job completed" },
++    ];
++    // Gemini model: normal kernel order (text before functionResponse per #3159)
++    const geminiAdapter = createGoogleAdapter({}, undefined, undefined, "gemini-3.8-flash-high");
++    const geminiBody = geminiAdapter.buildRequest(messages, "prompt", {});
++    const geminiContents = geminiBody.contents as Array<{ role: string; parts: Array<Record<string, unknown>> }>;
++    const geminiUserParts = geminiContents[1].parts;
++    assert.equal(geminiUserParts[0].text !== undefined, true, "Gemini allows text before functionResponse");
++
++    // Claude model: functionResponse MUST precede text for Anthropic tool_result pairing
++    const claudeAdapter = createGoogleAdapter({}, undefined, undefined, "claude-opus-5-5-high");
++    const claudeBody = claudeAdapter.buildRequest(messages, "prompt", {});
++    const claudeContents = claudeBody.contents as Array<{ role: string; parts: Array<Record<string, unknown>> }>;
++    const claudeUserParts = claudeContents[1].parts;
++    assert.equal(claudeUserParts[0].functionResponse !== undefined, true, "Claude wire requires functionResponse as leading part");
++    assert.equal((claudeUserParts[0].functionResponse as Record<string, unknown>).id, "toolu_123");
++    assert.equal(claudeUserParts[1].text !== undefined, true, "subsequent text parts trail functionResponse");
++});
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,128 @@
+From 46ad0ff15f687b0d36b035460937004a744022a6 Mon Sep 17 00:00:00 2001
+From: kaijianding <kaijian.ding@gmail.com>
+Date: Sun, 1 Nov 2026 18:37:51 +0800
+Subject: [PATCH 3/8] fix(google): ensure functionCall parts carry
+ thoughtSignature or fallback sentinel
+
+---
+ src/loop/adapter-google.ts   |  3 ++-
+ src/server/prepare-google.ts |  6 ++++--
+ src/util.ts                  | 26 ++++++++++++++++++++++++++
+ tests/adapter-google.test.ts | 18 ++++++++++++++++++
+ 4 files changed, 50 insertions(+), 3 deletions(-)
+
+diff --git a/src/loop/adapter-google.ts b/src/loop/adapter-google.ts
+index 44ef8e67d..fe1b55f6e 100644
+--- a/src/loop/adapter-google.ts
++++ b/src/loop/adapter-google.ts
+@@ -6,7 +6,7 @@ import { composeStreamFilters, createBiliArtifactFilter, createMarkerLineFilter,
+ import { degenerateTurnWarning } from "../degenerate-turn.js";
+ import { log as loggerLog } from "../logger.js";
+ import { normalizeSseLineEndings, finalizeSseLineEndings } from "../sse-util.js";
+-import { ensureGoogleClaudeWireOrder, isClaudeModel } from "../util.js";
++import { ensureGoogleClaudeWireOrder, ensureGoogleThoughtSignatures, isClaudeModel } from "../util.js";
+ 
+ import type {
+     CompressLoopAdapter,
+@@ -278,6 +278,7 @@ export function createGoogleAdapter(
+             if (isClaudeModel(modelVersion)) {
+                 contents = ensureGoogleClaudeWireOrder(contents);
+             }
++            contents = ensureGoogleThoughtSignatures(contents);
+             if (notes && notes.length > 0) {
+                 for (const text of notes) contents.push({ role: "user", parts: [{ text }] });
+             }
+diff --git a/src/server/prepare-google.ts b/src/server/prepare-google.ts
+index 797903d7a..7f1ca1e33 100644
+--- a/src/server/prepare-google.ts
++++ b/src/server/prepare-google.ts
+@@ -4,7 +4,7 @@ import { renderNudgeText, viableRanges } from "acp-kernel";
+ import { coreToGoogle, googleToCore, normalizeGoogleUserPartOrder, type BiliMessage, type GoogleContent, type GoogleRequestBody, type GoogleSystemInstruction, type GoogleTool } from "acp-kernel/wire";
+ import type { ProxyOptions } from "../config.js";
+ import { pluginAgentHeader } from "../plugin.js";
+-import { currentCalibrationFactor, ensureGoogleClaudeWireOrder, isClaudeModel } from "../util.js";
++import { currentCalibrationFactor, ensureGoogleClaudeWireOrder, ensureGoogleThoughtSignatures, isClaudeModel } from "../util.js";
+ import { diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, makeFoldPointReasoningDroppable, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, usageGradeInputBaseline, type Prepared } from "../server.js";
+ import { isStrictReasoningEcho } from "../strict-echo.js";
+ import { yieldToEventLoop } from "../yield-loop.js";
+@@ -399,7 +399,8 @@ export async function prepareGoogle(
+         processedMessages = [];
+     }
+ 
+-    const finalContents = isClaudeModel(model) ? ensureGoogleClaudeWireOrder(rebuiltContents) : rebuiltContents;
++    let finalContents = isClaudeModel(model) ? ensureGoogleClaudeWireOrder(rebuiltContents) : rebuiltContents;
++    finalContents = ensureGoogleThoughtSignatures(finalContents);
+     const rebuilt: GoogleRequestBody = { ...parsed, contents: finalContents, tools: toolsOut, systemInstruction };
+     clampOutgoingOutput(rebuilt as Record<string, unknown>, "generationConfig.maxOutputTokens", { systemText: googleClientSystem, tools: toolsOut, processedMessages, lastInputTokens: session.stats.lastInputTokens, lastInputTokensSource: session.stats.lastInputTokensSource, nativeWindow, headroomWindow: config.modelContextLimit, imageTokens: imageReserveFor(session, "google", rebuilt, opts, upstreamOrigin), kFactor: currentCalibrationFactor(session.stats, session.metadata?.lastModel), kOrigin: session.stats.calibratedEstimateOrigin, origin: upstreamOrigin, ledgerFloorTokens: dshLedgerFloorTokens(session.metadata), knownOutputCeiling: resolveKnownOutputCeiling(req.headers, parsed as Record<string, unknown>, opts.routes, upstreamOrigin, opts.sessionHeader, model) }, sessionId, log, (c) => { session.stats.lastOutputClamp = { ...c, at: Date.now() }; });
+     // #532: title-gen side requests carry their own tiny system — skip them.
+@@ -444,6 +445,7 @@ export function prepareGoogleCountTokens(
+         let contents = coreToGoogle(stripped as BiliMessage[]);
+         const m = typeof session.metadata?.lastModel === "string" ? session.metadata.lastModel : undefined;
+         if (isClaudeModel(m)) contents = ensureGoogleClaudeWireOrder(contents);
++        contents = ensureGoogleThoughtSignatures(contents);
+         const rebuilt: GoogleRequestBody = { ...parsed, contents };
+         log("info", `[${sessionId}] countTokens pruned: ${msgs.length} → ${stripped.length} msgs`);
+         return {
+diff --git a/src/util.ts b/src/util.ts
+index e299d8202..d567051e3 100644
+--- a/src/util.ts
++++ b/src/util.ts
+@@ -828,3 +828,29 @@ export function ensureGoogleClaudeWireOrder(contents: GoogleContent[]): GoogleCo
+         return { ...c, parts: [...frs, ...texts, ...others] };
+     });
+ }
++
++export const GOOGLE_SKIP_THOUGHT_SIGNATURE = "skip_thought_signature_validator";
++
++/**
++ * Gemini 3+ / 4 wire compatibility:
++ * Upstream Google Antigravity / Gemini Cloud Code requires every functionCall part
++ * in replayed contents to carry a thoughtSignature. If a tool call comes without
++ * a thoughtSignature (e.g. parallel calls where model only signed the first, or calls
++ * generated by another model/subagent), upstream rejects with a 400 error:
++ * "Function call is missing a thought_signature in functionCall parts".
++ * Google documents the sentinel "skip_thought_signature_validator" as fallback.
++ */
++export function ensureGoogleThoughtSignatures(contents: GoogleContent[]): GoogleContent[] {
++    return contents.map((c) => {
++        if (!Array.isArray(c.parts)) return c;
++        let changed = false;
++        const parts = c.parts.map((p) => {
++            if (p.functionCall !== undefined && (!p.thoughtSignature || typeof p.thoughtSignature !== "string" || p.thoughtSignature.length === 0)) {
++                changed = true;
++                return { ...p, thoughtSignature: GOOGLE_SKIP_THOUGHT_SIGNATURE };
++            }
++            return p;
++        });
++        return changed ? { ...c, parts } : c;
++    });
++}
+diff --git a/tests/adapter-google.test.ts b/tests/adapter-google.test.ts
+index 8033ba02a..587cb847a 100644
+--- a/tests/adapter-google.test.ts
++++ b/tests/adapter-google.test.ts
+@@ -372,3 +372,21 @@ test("google buildRequest: ensure tool_result precedes text for Claude models on
+     assert.equal((claudeUserParts[0].functionResponse as Record<string, unknown>).id, "toolu_123");
+     assert.equal(claudeUserParts[1].text !== undefined, true, "subsequent text parts trail functionResponse");
+ });
++
++test("google buildRequest: ensure functionCall parts carry thoughtSignature or fallback sentinel", () => {
++    const messages: CoreMessage[] = [
++        { id: "m1", role: "assistant", contentType: "tool-call", toolName: "read", toolCallId: "call_1", text: "{\"path\":\"a.txt\"}" },
++        { id: "m2", role: "assistant", contentType: "tool-call", toolName: "glob", toolCallId: "call_2", text: "{}" },
++        { id: "m3", role: "tool", contentType: "tool-result", toolName: "read", toolCallId: "call_1", text: "content" },
++        { id: "m4", role: "tool", contentType: "tool-result", toolName: "glob", toolCallId: "call_2", text: "files" },
++    ];
++    const adapter = createGoogleAdapter({}, undefined, undefined, "gemini-4-argon-high");
++    const body = adapter.buildRequest(messages, "prompt", {});
++    const contents = body.contents as Array<{ role: string; parts: Array<Record<string, unknown>> }>;
++    const modelParts = contents[0].parts;
++    assert.equal(modelParts.length, 2, "2 tool calls emitted");
++    assert.equal(modelParts[0].functionCall !== undefined, true);
++    assert.equal(modelParts[0].thoughtSignature, "skip_thought_signature_validator", "missing signature gets fallback sentinel");
++    assert.equal(modelParts[1].functionCall !== undefined, true);
++    assert.equal(modelParts[1].thoughtSignature, "skip_thought_signature_validator", "missing signature on parallel call gets fallback sentinel");
++});
+-- 
+2.54.0 (Apple Git-157)
+

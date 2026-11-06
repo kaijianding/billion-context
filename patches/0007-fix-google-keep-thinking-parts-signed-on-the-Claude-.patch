@@ -1,0 +1,246 @@
+From f636b40e1d0ca0143daf2847e5452c3b39844329 Mon Sep 17 00:00:00 2001
+From: "kaijian.ding" <kaijian.ding@gmail.com>
+Date: Fri, 6 Nov 2026 11:42:30 +0800
+Subject: [PATCH 7/8] fix(google): keep thinking parts signed on the Claude
+ wire
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Two independent ways an unsigned thinking block reached Cloud Code, both of
+which it rejects with "messages.N.content.N.thinking.signature: Field
+required":
+
+1. `reasoningPart()` returned the raw thought head verbatim whenever one
+   existed, so the sidecar `googleThoughtSignature` never landed. Gemini
+   streams thought text and its signature as separate parts (#3158), so a head
+   captured before the signature arrived is unsigned even though the core holds
+   it. The signature now falls back to the sidecar when the head has none.
+
+2. A thought part that was never signed at all cannot be repaired here —
+   `skip_thought_signature_validator` is not a signature on this wire (see
+   ensureGoogleThoughtSignatures). For Claude the part is now dropped:
+   thinking blocks are optional in history, so the turn stays legal.
+
+`ensureGoogleClaudeWireOrder` becomes `ensureGoogleClaudeWireRules` since it
+now owns both Claude wire invariants (tool_result pairing + thinking
+signatures).
+
+Live check against daily-cloudcode-pa.googleapis.com (claude-opus-5-5-low):
+keeping the unsigned thought reproduces the reported 400 verbatim; dropping it
+removes the thinking error and the turn proceeds.
+---
+ kernel/src/wire/google.ts    | 18 ++++++-----
+ src/loop/adapter-google.ts   |  4 +--
+ src/server/prepare-google.ts |  8 ++---
+ src/util.ts                  | 22 ++++++++++---
+ tests/adapter-google.test.ts | 60 ++++++++++++++++++++++++++++++++++++
+ 5 files changed, 95 insertions(+), 17 deletions(-)
+
+diff --git a/kernel/src/wire/google.ts b/kernel/src/wire/google.ts
+index 298d3948e..157d61d30 100644
+--- a/kernel/src/wire/google.ts
++++ b/kernel/src/wire/google.ts
+@@ -444,16 +444,20 @@ export function conversationSignalGoogle(
+ 
+ /** A reasoning core: its raw thought part verbatim (text refreshed — the
+  *  kernel re-renders core text with ref tags/truncation), else a
+- *  reconstructed `{thought:true}` part carrying the sidecar signature. */
++ *  reconstructed `{thought:true}` part carrying the sidecar signature.
++ *
++ *  The signature always comes from the sidecar when the raw head has none:
++ *  Gemini streams thought text and signature as separate parts (#3158), so a
++ *  raw head captured before the signature arrived is unsigned even though the
++ *  core does hold it. Dropping it there sends an unsigned thinking block, and
++ *  the Anthropic translation behind Cloud Code rejects it with
++ *  `thinking.signature: Field required`. */
+ function reasoningPart(m: BiliMessage): GooglePart {
+   const text = m.text ?? "";
+   const head = rawParts(m)[0];
+-  if (head) return { ...head, text, thought: true };
+-  return {
+-    text,
+-    thought: true,
+-    ...signatureField("thoughtSignature", m.googleThoughtSignature),
+-  };
++  const headSig = head && typeof head.thoughtSignature === "string" ? head.thoughtSignature : undefined;
++  const base: GooglePart = head ? { ...head, text, thought: true } : { text, thought: true };
++  return { ...base, ...signatureField("thoughtSignature", headSig ?? m.googleThoughtSignature) };
+ }
+ 
+ function toolCallPart(m: BiliMessage): GooglePart {
+diff --git a/src/loop/adapter-google.ts b/src/loop/adapter-google.ts
+index 181cd6eb5..8d14aa337 100644
+--- a/src/loop/adapter-google.ts
++++ b/src/loop/adapter-google.ts
+@@ -6,7 +6,7 @@ import { composeStreamFilters, createBiliArtifactFilter, createMarkerLineFilter,
+ import { degenerateTurnWarning } from "../degenerate-turn.js";
+ import { log as loggerLog } from "../logger.js";
+ import { normalizeSseLineEndings, finalizeSseLineEndings } from "../sse-util.js";
+-import { ensureGoogleClaudeWireOrder, ensureGoogleThoughtSignatures, isClaudeModel } from "../util.js";
++import { ensureGoogleClaudeWireRules, ensureGoogleThoughtSignatures, isClaudeModel } from "../util.js";
+ 
+ import type {
+     CompressLoopAdapter,
+@@ -276,7 +276,7 @@ export function createGoogleAdapter(
+         buildRequest(coreMessages, systemPrompt, body) {
+             let contents = coreToGoogle(coreMessages);
+             if (isClaudeModel(modelVersion)) {
+-                contents = ensureGoogleClaudeWireOrder(contents);
++                contents = ensureGoogleClaudeWireRules(contents);
+             }
+             contents = ensureGoogleThoughtSignatures(contents, modelVersion);
+             if (notes && notes.length > 0) {
+diff --git a/src/server/prepare-google.ts b/src/server/prepare-google.ts
+index e741cd5bb..1a5d096e7 100644
+--- a/src/server/prepare-google.ts
++++ b/src/server/prepare-google.ts
+@@ -4,7 +4,7 @@ import { renderNudgeText, viableRanges } from "acp-kernel";
+ import { coreToGoogle, googleToCore, normalizeGoogleUserPartOrder, type BiliMessage, type GoogleContent, type GoogleRequestBody, type GoogleSystemInstruction, type GoogleTool } from "acp-kernel/wire";
+ import type { ProxyOptions } from "../config.js";
+ import { pluginAgentHeader } from "../plugin.js";
+-import { currentCalibrationFactor, ensureGoogleClaudeWireOrder, ensureGoogleThoughtSignatures, isClaudeModel } from "../util.js";
++import { currentCalibrationFactor, ensureGoogleClaudeWireRules, ensureGoogleThoughtSignatures, isClaudeModel } from "../util.js";
+ import { diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, makeFoldPointReasoningDroppable, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, usageGradeInputBaseline, type Prepared } from "../server.js";
+ import { isStrictReasoningEcho } from "../strict-echo.js";
+ import { yieldToEventLoop } from "../yield-loop.js";
+@@ -296,7 +296,7 @@ export async function prepareGoogle(
+         const egressMessages = await applyImageRescalePass(processedMessages as BiliMessage[], { session, sessionId, log, maxDim: imageRescaleMaxDim(), toolArmed: imageRescaleToolArmed(session) });
+         rebuiltContents = coreToGoogle(egressMessages);
+         if (isClaudeModel(model)) {
+-            rebuiltContents = ensureGoogleClaudeWireOrder(rebuiltContents);
++            rebuiltContents = ensureGoogleClaudeWireRules(rebuiltContents);
+         }
+ 
+         // ONLY the static compress prompt joins the client's system text — the
+@@ -399,7 +399,7 @@ export async function prepareGoogle(
+         processedMessages = [];
+     }
+ 
+-    let finalContents = isClaudeModel(model) ? ensureGoogleClaudeWireOrder(rebuiltContents) : rebuiltContents;
++    let finalContents = isClaudeModel(model) ? ensureGoogleClaudeWireRules(rebuiltContents) : rebuiltContents;
+     finalContents = ensureGoogleThoughtSignatures(finalContents, model);
+     const rebuilt: GoogleRequestBody = { ...parsed, contents: finalContents, tools: toolsOut, systemInstruction };
+     clampOutgoingOutput(rebuilt as Record<string, unknown>, "generationConfig.maxOutputTokens", { systemText: googleClientSystem, tools: toolsOut, processedMessages, lastInputTokens: session.stats.lastInputTokens, lastInputTokensSource: session.stats.lastInputTokensSource, nativeWindow, headroomWindow: config.modelContextLimit, imageTokens: imageReserveFor(session, "google", rebuilt, opts, upstreamOrigin), kFactor: currentCalibrationFactor(session.stats, session.metadata?.lastModel), kOrigin: session.stats.calibratedEstimateOrigin, origin: upstreamOrigin, ledgerFloorTokens: dshLedgerFloorTokens(session.metadata), knownOutputCeiling: resolveKnownOutputCeiling(req.headers, parsed as Record<string, unknown>, opts.routes, upstreamOrigin, opts.sessionHeader, model) }, sessionId, log, (c) => { session.stats.lastOutputClamp = { ...c, at: Date.now() }; });
+@@ -444,7 +444,7 @@ export function prepareGoogleCountTokens(
+         const stripped = stripKernelSummaries(turn.messages, turn.state);
+         let contents = coreToGoogle(stripped as BiliMessage[]);
+         const m = typeof session.metadata?.lastModel === "string" ? session.metadata.lastModel : undefined;
+-        if (isClaudeModel(m)) contents = ensureGoogleClaudeWireOrder(contents);
++        if (isClaudeModel(m)) contents = ensureGoogleClaudeWireRules(contents);
+         contents = ensureGoogleThoughtSignatures(contents, m);
+         const rebuilt: GoogleRequestBody = { ...parsed, contents };
+         log("info", `[${sessionId}] countTokens pruned: ${msgs.length} → ${stripped.length} msgs`);
+diff --git a/src/util.ts b/src/util.ts
+index 0833b149c..7d102a20e 100644
+--- a/src/util.ts
++++ b/src/util.ts
+@@ -812,19 +812,33 @@ export function isClaudeModel(model: string | undefined): boolean {
+  * user message. Plain text parts can never precede `functionResponse` parts, or
+  * Vertex AI Claude rejects the request with a 400 error:
+  * "messages.N: `tool_use` ids were found without `tool_result` blocks immediately after".
++ *
++ * The same translation makes every `{thought:true}` part an Anthropic thinking
++ * block, and a thinking block MUST carry a signature — an unsigned one is
++ * rejected with "messages.N.content.N.thinking.signature: Field required"
++ * (verified against a live antigravity 400). The signature cannot be invented
++ * here: `skip_thought_signature_validator` is not a signature on this wire
++ * (see ensureGoogleThoughtSignatures), so an unsigned thought part is dropped
++ * instead. Thinking blocks are optional in history, so the turn stays legal.
+  */
+-export function ensureGoogleClaudeWireOrder(contents: GoogleContent[]): GoogleContent[] {
++export function ensureGoogleClaudeWireRules(contents: GoogleContent[]): GoogleContent[] {
+     return contents.map((c) => {
+-        if (c.role !== "user" || !Array.isArray(c.parts)) return c;
++        if (!Array.isArray(c.parts)) return c;
++        const kept = c.parts.filter(
++            (p) => !(p.thought === true && (typeof p.thoughtSignature !== "string" || p.thoughtSignature.length === 0)),
++        );
++        if (c.role !== "user") return kept.length === c.parts.length ? c : { ...c, parts: kept };
+         const frs: GooglePart[] = [];
+         const texts: GooglePart[] = [];
+         const others: GooglePart[] = [];
+-        for (const p of c.parts) {
++        for (const p of kept) {
+             if (p.functionResponse !== undefined) frs.push(p);
+             else if (typeof p.text === "string") texts.push(p);
+             else others.push(p);
+         }
+-        if (frs.length === 0 || texts.length === 0) return c;
++        if (frs.length === 0 || texts.length === 0) {
++            return kept.length === c.parts.length ? c : { ...c, parts: kept };
++        }
+         return { ...c, parts: [...frs, ...texts, ...others] };
+     });
+ }
+diff --git a/tests/adapter-google.test.ts b/tests/adapter-google.test.ts
+index eb7388307..039ba8886 100644
+--- a/tests/adapter-google.test.ts
++++ b/tests/adapter-google.test.ts
+@@ -401,3 +401,63 @@ test("google buildRequest: ensure functionCall parts carry thoughtSignature or f
+     assert.equal(claudeParts[0].thoughtSignature, undefined, "Claude keeps unsigned functionCall parts unsigned");
+     assert.equal(claudeParts[1].thoughtSignature, undefined, "Claude keeps parallel unsigned calls unsigned");
+ });
++
++test("google buildRequest: a reasoning core keeps the sidecar signature when its raw head has none", () => {
++    // Gemini streams thought text and its signature as separate parts (#3158),
++    // so a raw head captured before the signature arrived is unsigned while the
++    // core still holds it. Replaying that head verbatim sent an unsigned thinking
++    // block, and Cloud Code rejected the turn with
++    // "messages.N.content.N.thinking.signature: Field required".
++    const signature = `Q0FRU3JRY0tFZ2dURUFJWUFq${"A".repeat(64)}`;
++    const messages = [
++        { id: "m1", role: "user", contentType: "text", text: "hi" },
++        {
++            id: "m2",
++            role: "assistant",
++            contentType: "reasoning",
++            text: "thinking about it",
++            rawGoogleParts: [{ text: "thinking about it", thought: true }],
++            googleThoughtSignature: signature,
++        },
++    ] as unknown as CoreMessage[];
++    const adapter = createGoogleAdapter({}, undefined, undefined, "claude-opus-5-5-high");
++    const body = adapter.buildRequest(messages, "prompt", {});
++    const contents = body.contents as Array<{ role: string; parts: Array<Record<string, unknown>> }>;
++    const thought = contents[1].parts[0];
++    assert.equal(thought.thought, true);
++    assert.equal(thought.thoughtSignature, signature, "sidecar signature is backfilled onto the raw thought part");
++});
++
++test("google buildRequest: Claude drops thought parts that carry no signature at all", () => {
++    const signature = `Q0FRU3JRY0tFZ2dURUFJWUFq${"A".repeat(64)}`;
++    const messages = [
++        { id: "m1", role: "user", contentType: "text", text: "hi" },
++        {
++            id: "m2",
++            role: "assistant",
++            contentType: "reasoning",
++            text: "unsigned thought",
++            rawGoogleParts: [{ text: "unsigned thought", thought: true }],
++        },
++        {
++            id: "m3",
++            role: "assistant",
++            contentType: "reasoning",
++            text: "signed thought",
++            googleThoughtSignature: signature,
++        },
++        { id: "m4", role: "assistant", contentType: "text", text: "answer" },
++    ] as unknown as CoreMessage[];
++
++    // Gemini wire tolerates an unsigned thought part; Claude's Anthropic
++    // translation does not (thinking.signature: Field required).
++    const geminiBody = createGoogleAdapter({}, undefined, undefined, "gemini-3.8-flash-high").buildRequest(messages, "prompt", {});
++    const geminiParts = (geminiBody.contents as Array<{ parts: Array<Record<string, unknown>> }>)[1].parts;
++    assert.equal(geminiParts.filter((p) => p.thought === true).length, 2, "gemini keeps both thoughts");
++
++    const claudeBody = createGoogleAdapter({}, undefined, undefined, "claude-opus-5-5-high").buildRequest(messages, "prompt", {});
++    const claudeParts = (claudeBody.contents as Array<{ parts: Array<Record<string, unknown>> }>)[1].parts;
++    const thoughts = claudeParts.filter((p) => p.thought === true);
++    assert.equal(thoughts.length, 1, "only the signed thought survives on the Claude wire");
++    assert.equal(thoughts[0].thoughtSignature, signature);
++});
+-- 
+2.54.0 (Apple Git-157)
+
