@@ -4,7 +4,7 @@ import { renderNudgeText, viableRanges } from "acp-kernel";
 import { coreToGoogle, googleToCore, normalizeGoogleUserPartOrder, type BiliMessage, type GoogleContent, type GoogleRequestBody, type GoogleSystemInstruction, type GoogleTool } from "acp-kernel/wire";
 import type { ProxyOptions } from "../config.js";
 import { pluginAgentHeader } from "../plugin.js";
-import { currentCalibrationFactor, ensureGoogleClaudeWireOrder, ensureGoogleThoughtSignatures, isClaudeModel } from "../util.js";
+import { currentCalibrationFactor, ensureGoogleClaudeWireRules, ensureGoogleThoughtSignatures, isClaudeModel } from "../util.js";
 import { diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, makeFoldPointReasoningDroppable, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, usageGradeInputBaseline, type Prepared } from "../server.js";
 import { isStrictReasoningEcho } from "../strict-echo.js";
 import { yieldToEventLoop } from "../yield-loop.js";
@@ -296,7 +296,7 @@ export async function prepareGoogle(
         const egressMessages = await applyImageRescalePass(processedMessages as BiliMessage[], { session, sessionId, log, maxDim: imageRescaleMaxDim(), toolArmed: imageRescaleToolArmed(session) });
         rebuiltContents = coreToGoogle(egressMessages);
         if (isClaudeModel(model)) {
-            rebuiltContents = ensureGoogleClaudeWireOrder(rebuiltContents);
+            rebuiltContents = ensureGoogleClaudeWireRules(rebuiltContents);
         }
 
         // ONLY the static compress prompt joins the client's system text — the
@@ -399,7 +399,7 @@ export async function prepareGoogle(
         processedMessages = [];
     }
 
-    let finalContents = isClaudeModel(model) ? ensureGoogleClaudeWireOrder(rebuiltContents) : rebuiltContents;
+    let finalContents = isClaudeModel(model) ? ensureGoogleClaudeWireRules(rebuiltContents) : rebuiltContents;
     finalContents = ensureGoogleThoughtSignatures(finalContents, model);
     const rebuilt: GoogleRequestBody = { ...parsed, contents: finalContents, tools: toolsOut, systemInstruction };
     clampOutgoingOutput(rebuilt as Record<string, unknown>, "generationConfig.maxOutputTokens", { systemText: googleClientSystem, tools: toolsOut, processedMessages, lastInputTokens: session.stats.lastInputTokens, lastInputTokensSource: session.stats.lastInputTokensSource, nativeWindow, headroomWindow: config.modelContextLimit, imageTokens: imageReserveFor(session, "google", rebuilt, opts, upstreamOrigin), kFactor: currentCalibrationFactor(session.stats, session.metadata?.lastModel), kOrigin: session.stats.calibratedEstimateOrigin, origin: upstreamOrigin, ledgerFloorTokens: dshLedgerFloorTokens(session.metadata), knownOutputCeiling: resolveKnownOutputCeiling(req.headers, parsed as Record<string, unknown>, opts.routes, upstreamOrigin, opts.sessionHeader, model) }, sessionId, log, (c) => { session.stats.lastOutputClamp = { ...c, at: Date.now() }; });
@@ -444,7 +444,7 @@ export function prepareGoogleCountTokens(
         const stripped = stripKernelSummaries(turn.messages, turn.state);
         let contents = coreToGoogle(stripped as BiliMessage[]);
         const m = typeof session.metadata?.lastModel === "string" ? session.metadata.lastModel : undefined;
-        if (isClaudeModel(m)) contents = ensureGoogleClaudeWireOrder(contents);
+        if (isClaudeModel(m)) contents = ensureGoogleClaudeWireRules(contents);
         contents = ensureGoogleThoughtSignatures(contents, m);
         const rebuilt: GoogleRequestBody = { ...parsed, contents };
         log("info", `[${sessionId}] countTokens pruned: ${msgs.length} → ${stripped.length} msgs`);

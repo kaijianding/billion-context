@@ -401,3 +401,63 @@ test("google buildRequest: ensure functionCall parts carry thoughtSignature or f
     assert.equal(claudeParts[0].thoughtSignature, undefined, "Claude keeps unsigned functionCall parts unsigned");
     assert.equal(claudeParts[1].thoughtSignature, undefined, "Claude keeps parallel unsigned calls unsigned");
 });
+
+test("google buildRequest: a reasoning core keeps the sidecar signature when its raw head has none", () => {
+    // Gemini streams thought text and its signature as separate parts (#3158),
+    // so a raw head captured before the signature arrived is unsigned while the
+    // core still holds it. Replaying that head verbatim sent an unsigned thinking
+    // block, and Cloud Code rejected the turn with
+    // "messages.N.content.N.thinking.signature: Field required".
+    const signature = `Q0FRU3JRY0tFZ2dURUFJWUFq${"A".repeat(64)}`;
+    const messages = [
+        { id: "m1", role: "user", contentType: "text", text: "hi" },
+        {
+            id: "m2",
+            role: "assistant",
+            contentType: "reasoning",
+            text: "thinking about it",
+            rawGoogleParts: [{ text: "thinking about it", thought: true }],
+            googleThoughtSignature: signature,
+        },
+    ] as unknown as CoreMessage[];
+    const adapter = createGoogleAdapter({}, undefined, undefined, "claude-opus-5-5-high");
+    const body = adapter.buildRequest(messages, "prompt", {});
+    const contents = body.contents as Array<{ role: string; parts: Array<Record<string, unknown>> }>;
+    const thought = contents[1].parts[0];
+    assert.equal(thought.thought, true);
+    assert.equal(thought.thoughtSignature, signature, "sidecar signature is backfilled onto the raw thought part");
+});
+
+test("google buildRequest: Claude drops thought parts that carry no signature at all", () => {
+    const signature = `Q0FRU3JRY0tFZ2dURUFJWUFq${"A".repeat(64)}`;
+    const messages = [
+        { id: "m1", role: "user", contentType: "text", text: "hi" },
+        {
+            id: "m2",
+            role: "assistant",
+            contentType: "reasoning",
+            text: "unsigned thought",
+            rawGoogleParts: [{ text: "unsigned thought", thought: true }],
+        },
+        {
+            id: "m3",
+            role: "assistant",
+            contentType: "reasoning",
+            text: "signed thought",
+            googleThoughtSignature: signature,
+        },
+        { id: "m4", role: "assistant", contentType: "text", text: "answer" },
+    ] as unknown as CoreMessage[];
+
+    // Gemini wire tolerates an unsigned thought part; Claude's Anthropic
+    // translation does not (thinking.signature: Field required).
+    const geminiBody = createGoogleAdapter({}, undefined, undefined, "gemini-3.8-flash-high").buildRequest(messages, "prompt", {});
+    const geminiParts = (geminiBody.contents as Array<{ parts: Array<Record<string, unknown>> }>)[1].parts;
+    assert.equal(geminiParts.filter((p) => p.thought === true).length, 2, "gemini keeps both thoughts");
+
+    const claudeBody = createGoogleAdapter({}, undefined, undefined, "claude-opus-5-5-high").buildRequest(messages, "prompt", {});
+    const claudeParts = (claudeBody.contents as Array<{ parts: Array<Record<string, unknown>> }>)[1].parts;
+    const thoughts = claudeParts.filter((p) => p.thought === true);
+    assert.equal(thoughts.length, 1, "only the signed thought survives on the Claude wire");
+    assert.equal(thoughts[0].thoughtSignature, signature);
+});

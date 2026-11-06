@@ -444,16 +444,20 @@ export function conversationSignalGoogle(
 
 /** A reasoning core: its raw thought part verbatim (text refreshed — the
  *  kernel re-renders core text with ref tags/truncation), else a
- *  reconstructed `{thought:true}` part carrying the sidecar signature. */
+ *  reconstructed `{thought:true}` part carrying the sidecar signature.
+ *
+ *  The signature always comes from the sidecar when the raw head has none:
+ *  Gemini streams thought text and signature as separate parts (#3158), so a
+ *  raw head captured before the signature arrived is unsigned even though the
+ *  core does hold it. Dropping it there sends an unsigned thinking block, and
+ *  the Anthropic translation behind Cloud Code rejects it with
+ *  `thinking.signature: Field required`. */
 function reasoningPart(m: BiliMessage): GooglePart {
   const text = m.text ?? "";
   const head = rawParts(m)[0];
-  if (head) return { ...head, text, thought: true };
-  return {
-    text,
-    thought: true,
-    ...signatureField("thoughtSignature", m.googleThoughtSignature),
-  };
+  const headSig = head && typeof head.thoughtSignature === "string" ? head.thoughtSignature : undefined;
+  const base: GooglePart = head ? { ...head, text, thought: true } : { text, thought: true };
+  return { ...base, ...signatureField("thoughtSignature", headSig ?? m.googleThoughtSignature) };
 }
 
 function toolCallPart(m: BiliMessage): GooglePart {

@@ -812,19 +812,33 @@ export function isClaudeModel(model: string | undefined): boolean {
  * user message. Plain text parts can never precede `functionResponse` parts, or
  * Vertex AI Claude rejects the request with a 400 error:
  * "messages.N: `tool_use` ids were found without `tool_result` blocks immediately after".
+ *
+ * The same translation makes every `{thought:true}` part an Anthropic thinking
+ * block, and a thinking block MUST carry a signature — an unsigned one is
+ * rejected with "messages.N.content.N.thinking.signature: Field required"
+ * (verified against a live antigravity 400). The signature cannot be invented
+ * here: `skip_thought_signature_validator` is not a signature on this wire
+ * (see ensureGoogleThoughtSignatures), so an unsigned thought part is dropped
+ * instead. Thinking blocks are optional in history, so the turn stays legal.
  */
-export function ensureGoogleClaudeWireOrder(contents: GoogleContent[]): GoogleContent[] {
+export function ensureGoogleClaudeWireRules(contents: GoogleContent[]): GoogleContent[] {
     return contents.map((c) => {
-        if (c.role !== "user" || !Array.isArray(c.parts)) return c;
+        if (!Array.isArray(c.parts)) return c;
+        const kept = c.parts.filter(
+            (p) => !(p.thought === true && (typeof p.thoughtSignature !== "string" || p.thoughtSignature.length === 0)),
+        );
+        if (c.role !== "user") return kept.length === c.parts.length ? c : { ...c, parts: kept };
         const frs: GooglePart[] = [];
         const texts: GooglePart[] = [];
         const others: GooglePart[] = [];
-        for (const p of c.parts) {
+        for (const p of kept) {
             if (p.functionResponse !== undefined) frs.push(p);
             else if (typeof p.text === "string") texts.push(p);
             else others.push(p);
         }
-        if (frs.length === 0 || texts.length === 0) return c;
+        if (frs.length === 0 || texts.length === 0) {
+            return kept.length === c.parts.length ? c : { ...c, parts: kept };
+        }
         return { ...c, parts: [...frs, ...texts, ...others] };
     });
 }
